@@ -1,0 +1,18 @@
+[package]
+name = "bench-google"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+protobuf = "=4.33.1-release"
+
+[build-dependencies]
+protobuf-codegen = "=4.33.1-release"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "protobuf"
+harness = false

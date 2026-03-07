@@ -1,0 +1,1066 @@
+//! Code generation context and descriptor-to-Rust mapping state.
+
+use std::collections::HashMap;
+
+use crate::features::{self, ResolvedFeatures};
+use crate::generated::descriptor::{DescriptorProto, EnumDescriptorProto, FileDescriptorProto};
+use crate::oneof::to_snake_case;
+use crate::CodeGenConfig;
+
+/// Shared context for a code generation run.
+///
+/// Holds the full set of file descriptors and a mapping from fully-qualified
+/// protobuf type names to their Rust type paths. This is needed because a
+/// field in one `.proto` file may reference a message defined in another.
+pub struct CodeGenContext<'a> {
+    /// All file descriptors (both requested and dependencies).
+    pub files: &'a [FileDescriptorProto],
+    /// Code generation configuration.
+    pub config: &'a CodeGenConfig,
+    /// Map from fully-qualified protobuf name (e.g., ".my.package.MyMessage")
+    /// to Rust type path (e.g., "my::package::MyMessage").
+    ///
+    /// Nested types use module-qualified paths:
+    /// ".pkg.Outer.Inner" → "pkg::outer::Inner" (not "pkg::OuterInner").
+    pub type_map: HashMap<String, String>,
+    /// Map from fully-qualified protobuf name to its proto package.
+    ///
+    /// Used by `rust_type_relative` to compute `super::`-based relative
+    /// paths for cross-package references within the same compilation.
+    package_of: HashMap<String, String>,
+    /// Map from fully-qualified enum name to its resolved `enum_type` feature.
+    ///
+    /// The `enum_type` feature determines whether an enum is OPEN or CLOSED.
+    /// It's resolved from the ENUM's own file → message → enum feature chain,
+    /// NOT from the referencing field's chain. protoc does not propagate
+    /// enum-level `enum_type` into field options (verified 2026-03), so
+    /// callers must look this up via `is_enum_closed`.
+    enum_closedness: HashMap<String, bool>,
+}
+
+impl<'a> CodeGenContext<'a> {
+    /// Build a context from file descriptors, populating the type map.
+    ///
+    /// `effective_extern_paths` includes both user-provided mappings and any
+    /// auto-injected defaults (e.g., the WKT mapping). These are computed by
+    /// `crate::effective_extern_paths` before calling this constructor.
+    pub fn new(
+        files: &'a [FileDescriptorProto],
+        config: &'a CodeGenConfig,
+        effective_extern_paths: &[(String, String)],
+    ) -> Self {
+        let mut type_map = HashMap::new();
+        let mut package_of = HashMap::new();
+        let mut enum_closedness = HashMap::new();
+
+        for file in files {
+            let package = file.package.as_deref().unwrap_or("");
+            let file_features = features::for_file(file);
+            let proto_prefix = if package.is_empty() {
+                String::from(".")
+            } else {
+                format!(".{}.", package)
+            };
+
+            // Check if this file's package matches an extern_path.
+            // If so, types are registered with the extern Rust path prefix.
+            let rust_module =
+                if let Some(rust_root) = resolve_extern_prefix(package, effective_extern_paths) {
+                    rust_root
+                } else {
+                    package.replace('.', "::")
+                };
+
+            // Register top-level messages
+            for msg in &file.message_type {
+                if let Some(name) = &msg.name {
+                    let fqn = format!("{}{}", proto_prefix, name);
+                    let rust_path = if rust_module.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}::{}", rust_module, name)
+                    };
+                    type_map.insert(fqn.clone(), rust_path);
+                    package_of.insert(fqn.clone(), package.to_string());
+
+                    // Register nested messages using module-qualified paths.
+                    let snake = to_snake_case(name);
+                    let parent_mod = if rust_module.is_empty() {
+                        snake
+                    } else {
+                        format!("{}::{}", rust_module, snake)
+                    };
+                    register_nested_types(
+                        &mut type_map,
+                        &mut package_of,
+                        package,
+                        &fqn,
+                        &parent_mod,
+                        msg,
+                    );
+                    register_nested_enum_closedness(
+                        &mut enum_closedness,
+                        &fqn,
+                        &file_features,
+                        msg,
+                    );
+                }
+            }
+
+            // Register top-level enums
+            for enum_type in &file.enum_type {
+                if let Some(name) = &enum_type.name {
+                    let fqn = format!("{}{}", proto_prefix, name);
+                    let rust_path = if rust_module.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}::{}", rust_module, name)
+                    };
+                    type_map.insert(fqn.clone(), rust_path);
+                    package_of.insert(fqn.clone(), package.to_string());
+                    register_enum_closedness(&mut enum_closedness, &fqn, &file_features, enum_type);
+                }
+            }
+        }
+
+        Self {
+            files,
+            config,
+            type_map,
+            package_of,
+            enum_closedness,
+        }
+    }
+
+    /// Build a context matching what [`generate()`](crate::generate) uses
+    /// internally.
+    ///
+    /// Computes effective extern paths (user-provided + auto-injected WKT
+    /// mapping to `buffa-types`) and builds the type map from them.
+    ///
+    /// Convenience for downstream generators (e.g. `connectrpc-codegen`)
+    /// that emit code alongside buffa's message types and need identical
+    /// type-path resolution. Using this instead of [`new()`](Self::new) +
+    /// manual extern-path computation ensures zero drift with buffa's own
+    /// generation.
+    pub fn for_generate(
+        files: &'a [FileDescriptorProto],
+        files_to_generate: &[String],
+        config: &'a CodeGenConfig,
+    ) -> Self {
+        let paths = crate::effective_extern_paths(files, files_to_generate, config);
+        Self::new(files, config, &paths)
+    }
+
+    /// Look up the Rust type path for a fully-qualified protobuf type name.
+    pub fn rust_type(&self, proto_fqn: &str) -> Option<&str> {
+        self.type_map.get(proto_fqn).map(|s| s.as_str())
+    }
+
+    /// Look up whether an enum (by fully-qualified proto name) is closed.
+    ///
+    /// Returns `None` if the enum is not in this compilation set (e.g., an
+    /// extern_path type), in which case callers should fall back to the
+    /// referencing field's feature chain (correct for proto2/proto3 where
+    /// `enum_type` is file-level anyway).
+    pub fn is_enum_closed(&self, proto_fqn: &str) -> Option<bool> {
+        self.enum_closedness.get(proto_fqn).copied()
+    }
+
+    /// Look up the Rust type path relative to the current code generation
+    /// scope.
+    ///
+    /// `current_package` is the proto package (e.g., `"google.protobuf"`).
+    /// `nesting` is the number of message module levels the generated code
+    /// sits inside (0 for struct fields and impls at the package level,
+    /// 1 for oneof enums inside a message module, etc.).
+    ///
+    /// - **Same package**: strips the package prefix and prepends `super::`
+    ///   for each nesting level.
+    /// - **Cross package (local)**: navigates via `super::` to the common
+    ///   ancestor, then descends into the target package. This works
+    ///   regardless of where the module tree is placed in the user's crate.
+    /// - **Cross package (extern)**: returns the absolute extern path as-is.
+    pub fn rust_type_relative(
+        &self,
+        proto_fqn: &str,
+        current_package: &str,
+        nesting: usize,
+    ) -> Option<String> {
+        let full_path = self.type_map.get(proto_fqn)?;
+
+        // Extern types use absolute paths (starting with `::` or `crate::`)
+        // and need no relative resolution — they work from any module position.
+        if full_path.starts_with("::") || full_path.starts_with("crate::") {
+            return Some(full_path.clone());
+        }
+
+        let target_package = self
+            .package_of
+            .get(proto_fqn)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        // Extract the type's path within its package (everything after the
+        // package module prefix).
+        let target_rust_module = target_package.replace('.', "::");
+        let type_suffix = if target_rust_module.is_empty() {
+            full_path.as_str()
+        } else {
+            full_path
+                .strip_prefix(&format!("{}::", target_rust_module))
+                .unwrap_or(full_path)
+        };
+
+        if current_package == target_package {
+            // Same package — just the type suffix, with super:: for nesting.
+            if nesting == 0 {
+                return Some(type_suffix.to_string());
+            }
+            let supers = (0..nesting).map(|_| "super").collect::<Vec<_>>().join("::");
+            return Some(format!("{}::{}", supers, type_suffix));
+        }
+
+        // Cross-package local type: compute a super::-based relative path.
+        let current_parts: Vec<&str> = if current_package.is_empty() {
+            vec![]
+        } else {
+            current_package.split('.').collect()
+        };
+        let target_parts: Vec<&str> = if target_package.is_empty() {
+            vec![]
+        } else {
+            target_package.split('.').collect()
+        };
+
+        // Find the length of the common package prefix.
+        let common_len = current_parts
+            .iter()
+            .zip(&target_parts)
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // Navigate up: one super:: per remaining current package segment,
+        // plus one per nesting level (message module depth).
+        let up_count = (current_parts.len() - common_len) + nesting;
+
+        // Navigate down: target package segments beyond the common prefix.
+        let down_parts = &target_parts[common_len..];
+
+        let mut segments: Vec<&str> = vec!["super"; up_count];
+        segments.extend_from_slice(down_parts);
+
+        // Append the type's within-package path.
+        let mut result = segments.join("::");
+        if !result.is_empty() {
+            result.push_str("::");
+        }
+        result.push_str(type_suffix);
+
+        Some(result)
+    }
+
+    /// Check whether a bytes field at the given proto path should use
+    /// `bytes::Bytes` instead of `Vec<u8>`.
+    ///
+    /// `field_fqn` is the fully-qualified proto field path, e.g.,
+    /// `".my.pkg.MyMessage.data"`. Matches against `config.bytes_fields`
+    /// entries, which are prefix-matched (so `"."` matches all fields).
+    pub fn use_bytes_type(&self, field_fqn: &str) -> bool {
+        self.config
+            .bytes_fields
+            .iter()
+            .any(|prefix| field_fqn.starts_with(prefix.as_str()))
+    }
+}
+
+/// Check if a proto package matches any extern_path prefix.
+///
+/// Returns the Rust module path root if matched, including any remaining
+/// package segments converted to `snake_case` modules. For example,
+/// extern_path `(".my", "::my_crate")` with package `"my.sub.pkg"` returns
+/// `"::my_crate::sub::pkg"`.
+fn resolve_extern_prefix(package: &str, extern_paths: &[(String, String)]) -> Option<String> {
+    let dotted = format!(".{}", package);
+
+    // Try longest prefix first so that more specific mappings take priority
+    // over broader ones (e.g., ".my.common" before ".my").
+    let mut best: Option<(&str, &str, usize)> = None;
+
+    for (proto_prefix, rust_prefix) in extern_paths {
+        if dotted == *proto_prefix {
+            // Exact match is always the best.
+            return Some(rust_prefix.clone());
+        }
+        if let Some(rest) = dotted.strip_prefix(proto_prefix.as_str()) {
+            if rest.starts_with('.') {
+                let prefix_len = proto_prefix.len();
+                if best.is_none_or(|(_, _, best_len)| prefix_len > best_len) {
+                    best = Some((proto_prefix, rust_prefix, prefix_len));
+                }
+            }
+        }
+    }
+
+    let (proto_prefix, rust_prefix, _) = best?;
+    let rest = dotted.strip_prefix(proto_prefix)?.strip_prefix('.')?;
+    let suffix = rest
+        .split('.')
+        .map(to_snake_case)
+        .collect::<Vec<_>>()
+        .join("::");
+    Some(format!("{}::{}", rust_prefix, suffix))
+}
+
+/// Recursively register nested messages and enums with module-qualified paths.
+///
+/// Each nested message `Parent.Child` maps to `parent_mod::Child` in Rust,
+/// where `parent_mod` is the snake_case module path of the enclosing message.
+fn register_nested_types(
+    type_map: &mut HashMap<String, String>,
+    package_of: &mut HashMap<String, String>,
+    package: &str,
+    parent_fqn: &str,
+    parent_mod: &str,
+    msg: &crate::generated::descriptor::DescriptorProto,
+) {
+    for nested in &msg.nested_type {
+        if let Some(name) = &nested.name {
+            let fqn = format!("{}.{}", parent_fqn, name);
+            let rust_path = format!("{}::{}", parent_mod, name);
+            type_map.insert(fqn.clone(), rust_path);
+            package_of.insert(fqn.clone(), package.to_string());
+
+            // Recurse: nested-of-nested goes in a deeper module.
+            let child_mod = format!("{}::{}", parent_mod, to_snake_case(name));
+            register_nested_types(type_map, package_of, package, &fqn, &child_mod, nested);
+        }
+    }
+
+    for enum_type in &msg.enum_type {
+        if let Some(name) = &enum_type.name {
+            let fqn = format!("{}.{}", parent_fqn, name);
+            let rust_path = format!("{}::{}", parent_mod, name);
+            type_map.insert(fqn.clone(), rust_path);
+            package_of.insert(fqn, package.to_string());
+        }
+    }
+}
+
+/// Resolve and record whether an enum is closed, given its parent's features.
+fn register_enum_closedness(
+    map: &mut HashMap<String, bool>,
+    fqn: &str,
+    parent_features: &ResolvedFeatures,
+    enum_desc: &EnumDescriptorProto,
+) {
+    let resolved = features::resolve_child(parent_features, features::enum_features(enum_desc));
+    let closed = resolved.enum_type == features::EnumType::Closed;
+    map.insert(fqn.to_string(), closed);
+}
+
+/// Walk nested messages and register all enum closedness, resolving features
+/// through the message hierarchy (file → msg → nested_msg → enum).
+fn register_nested_enum_closedness(
+    map: &mut HashMap<String, bool>,
+    parent_fqn: &str,
+    parent_features: &ResolvedFeatures,
+    msg: &DescriptorProto,
+) {
+    let msg_features = features::resolve_child(parent_features, features::message_features(msg));
+    for enum_type in &msg.enum_type {
+        if let Some(name) = &enum_type.name {
+            let fqn = format!("{}.{}", parent_fqn, name);
+            register_enum_closedness(map, &fqn, &msg_features, enum_type);
+        }
+    }
+    for nested in &msg.nested_type {
+        if let Some(name) = &nested.name {
+            let fqn = format!("{}.{}", parent_fqn, name);
+            register_nested_enum_closedness(map, &fqn, &msg_features, nested);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generated::descriptor::{DescriptorProto, EnumDescriptorProto, FileDescriptorProto};
+
+    fn make_file(
+        name: &str,
+        package: &str,
+        messages: Vec<DescriptorProto>,
+        enums: Vec<EnumDescriptorProto>,
+    ) -> FileDescriptorProto {
+        FileDescriptorProto {
+            name: Some(name.to_string()),
+            package: if package.is_empty() {
+                None
+            } else {
+                Some(package.to_string())
+            },
+            message_type: messages,
+            enum_type: enums,
+            ..Default::default()
+        }
+    }
+
+    fn msg(name: &str) -> DescriptorProto {
+        DescriptorProto {
+            name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn msg_with_nested(name: &str, nested: Vec<DescriptorProto>) -> DescriptorProto {
+        DescriptorProto {
+            name: Some(name.to_string()),
+            nested_type: nested,
+            ..Default::default()
+        }
+    }
+
+    fn msg_with_nested_and_enums(
+        name: &str,
+        nested: Vec<DescriptorProto>,
+        enums: Vec<EnumDescriptorProto>,
+    ) -> DescriptorProto {
+        DescriptorProto {
+            name: Some(name.to_string()),
+            nested_type: nested,
+            enum_type: enums,
+            ..Default::default()
+        }
+    }
+
+    fn enum_desc(name: &str) -> EnumDescriptorProto {
+        EnumDescriptorProto {
+            name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn enum_with_closed_feature(name: &str) -> EnumDescriptorProto {
+        use crate::generated::descriptor::{feature_set, EnumOptions, FeatureSet};
+        EnumDescriptorProto {
+            name: Some(name.to_string()),
+            options: buffa::MessageField::some(EnumOptions {
+                features: buffa::MessageField::some(FeatureSet {
+                    enum_type: Some(feature_set::EnumType::CLOSED),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn editions_file(
+        name: &str,
+        package: &str,
+        messages: Vec<DescriptorProto>,
+        enums: Vec<EnumDescriptorProto>,
+    ) -> FileDescriptorProto {
+        use crate::generated::descriptor::Edition;
+        FileDescriptorProto {
+            name: Some(name.to_string()),
+            package: Some(package.to_string()),
+            syntax: Some("editions".to_string()),
+            edition: Some(Edition::EDITION_2023),
+            message_type: messages,
+            enum_type: enums,
+            ..Default::default()
+        }
+    }
+
+    // ── Type registration tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_message_with_package() {
+        let files = [make_file(
+            "test.proto",
+            "my.package",
+            vec![msg("Foo")],
+            vec![],
+        )];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".my.package.Foo"), Some("my::package::Foo"));
+    }
+
+    #[test]
+    fn test_message_no_package() {
+        let files = [make_file("test.proto", "", vec![msg("Bar")], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".Bar"), Some("Bar"));
+    }
+
+    #[test]
+    fn test_nested_message_uses_module_path() {
+        let outer = msg_with_nested("Outer", vec![msg("Inner")]);
+        let files = [make_file("test.proto", "pkg", vec![outer], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".pkg.Outer"), Some("pkg::Outer"));
+        // Nested types use module-qualified paths.
+        assert_eq!(ctx.rust_type(".pkg.Outer.Inner"), Some("pkg::outer::Inner"));
+    }
+
+    #[test]
+    fn test_nested_message_no_package() {
+        let outer = msg_with_nested("Outer", vec![msg("Inner")]);
+        let files = [make_file("test.proto", "", vec![outer], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".Outer"), Some("Outer"));
+        assert_eq!(ctx.rust_type(".Outer.Inner"), Some("outer::Inner"));
+    }
+
+    #[test]
+    fn test_deeply_nested_message() {
+        let deep = msg_with_nested("A", vec![msg_with_nested("B", vec![msg("C")])]);
+        let files = [make_file("test.proto", "pkg", vec![deep], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".pkg.A"), Some("pkg::A"));
+        assert_eq!(ctx.rust_type(".pkg.A.B"), Some("pkg::a::B"));
+        assert_eq!(ctx.rust_type(".pkg.A.B.C"), Some("pkg::a::b::C"));
+    }
+
+    #[test]
+    fn test_nested_enum_uses_module_path() {
+        let outer = msg_with_nested_and_enums("Outer", vec![], vec![enum_desc("Status")]);
+        let files = [make_file("test.proto", "pkg", vec![outer], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(
+            ctx.rust_type(".pkg.Outer.Status"),
+            Some("pkg::outer::Status")
+        );
+    }
+
+    #[test]
+    fn test_top_level_enum() {
+        let files = [make_file(
+            "test.proto",
+            "pkg",
+            vec![],
+            vec![enum_desc("Status")],
+        )];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".pkg.Status"), Some("pkg::Status"));
+    }
+
+    #[test]
+    fn test_same_named_nested_types_in_different_parents_are_distinct() {
+        let outer1 = msg_with_nested("Outer1", vec![msg("Inner")]);
+        let outer2 = msg_with_nested("Outer2", vec![msg("Inner")]);
+        let files = [make_file("a.proto", "pkg", vec![outer1, outer2], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // Different parent modules make them distinct.
+        assert_eq!(
+            ctx.rust_type(".pkg.Outer1.Inner"),
+            Some("pkg::outer1::Inner")
+        );
+        assert_eq!(
+            ctx.rust_type(".pkg.Outer2.Inner"),
+            Some("pkg::outer2::Inner")
+        );
+        assert_ne!(
+            ctx.rust_type(".pkg.Outer1.Inner"),
+            ctx.rust_type(".pkg.Outer2.Inner")
+        );
+    }
+
+    #[test]
+    fn test_multiple_files() {
+        let files = [
+            make_file("a.proto", "ns.a", vec![msg("MsgA")], vec![]),
+            make_file("b.proto", "ns.b", vec![msg("MsgB")], vec![]),
+        ];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".ns.a.MsgA"), Some("ns::a::MsgA"));
+        assert_eq!(ctx.rust_type(".ns.b.MsgB"), Some("ns::b::MsgB"));
+    }
+
+    #[test]
+    fn test_keyword_package_segment_in_type_map() {
+        // Proto package `google.type` — the type map stores plain string paths.
+        // Keyword escaping happens at the token level, not in the type map.
+        let files = [make_file(
+            "latlng.proto",
+            "google.type",
+            vec![msg("LatLng")],
+            vec![],
+        )];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(
+            ctx.rust_type(".google.type.LatLng"),
+            Some("google::type::LatLng")
+        );
+    }
+
+    #[test]
+    fn test_keyword_package_relative_same_package() {
+        let files = [make_file(
+            "latlng.proto",
+            "google.type",
+            vec![msg("LatLng"), msg("Expr")],
+            vec![],
+        )];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // Same-package reference: just the type name (no module prefix).
+        assert_eq!(
+            ctx.rust_type_relative(".google.type.LatLng", "google.type", 0),
+            Some("LatLng".into())
+        );
+    }
+
+    #[test]
+    fn test_keyword_package_cross_package() {
+        let files = [
+            make_file("latlng.proto", "google.type", vec![msg("LatLng")], vec![]),
+            make_file("svc.proto", "google.cloud", vec![msg("Service")], vec![]),
+        ];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // Cross-package: relative path via super:: (keyword escaping at token level).
+        // From google.cloud, go up one (past "cloud"), then into "type".
+        assert_eq!(
+            ctx.rust_type_relative(".google.type.LatLng", "google.cloud", 0),
+            Some("super::type::LatLng".into())
+        );
+    }
+
+    #[test]
+    fn test_keyword_nested_message_module() {
+        // Message named "Type" → module "type" in type map.
+        let outer = msg_with_nested("Type", vec![msg("Inner")]);
+        let files = [make_file("test.proto", "pkg", vec![outer], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".pkg.Type"), Some("pkg::Type"));
+        assert_eq!(ctx.rust_type(".pkg.Type.Inner"), Some("pkg::type::Inner"));
+    }
+
+    #[test]
+    fn test_unknown_type_returns_none() {
+        let files = [make_file("test.proto", "pkg", vec![msg("Foo")], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type(".pkg.Unknown"), None);
+    }
+
+    // ── Relative type resolution tests ───────────────────────────────────
+
+    #[test]
+    fn test_relative_same_package_top_level() {
+        let files = [make_file("a.proto", "pkg", vec![msg("Foo")], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // From top-level in same package: just the type name.
+        assert_eq!(
+            ctx.rust_type_relative(".pkg.Foo", "pkg", 0),
+            Some("Foo".into())
+        );
+    }
+
+    #[test]
+    fn test_relative_cross_package() {
+        let files = [
+            make_file("a.proto", "pkg_a", vec![msg("Foo")], vec![]),
+            make_file("b.proto", "pkg_b", vec![msg("Bar")], vec![]),
+        ];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // Cross-package: relative via super:: (up one from pkg_b, into pkg_a).
+        assert_eq!(
+            ctx.rust_type_relative(".pkg_a.Foo", "pkg_b", 0),
+            Some("super::pkg_a::Foo".into())
+        );
+    }
+
+    #[test]
+    fn test_relative_no_package() {
+        let files = [make_file("a.proto", "", vec![msg("Foo")], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type_relative(".Foo", "", 0), Some("Foo".into()));
+    }
+
+    #[test]
+    fn test_relative_unknown_returns_none() {
+        let files = [make_file("a.proto", "pkg", vec![msg("Foo")], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.rust_type_relative(".pkg.Unknown", "pkg", 0), None);
+    }
+
+    #[test]
+    fn test_relative_dotted_package() {
+        let files = [make_file("a.proto", "my.pkg", vec![msg("Foo")], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(
+            ctx.rust_type_relative(".my.pkg.Foo", "my.pkg", 0),
+            Some("Foo".into())
+        );
+    }
+
+    #[test]
+    fn test_relative_cross_dotted_packages() {
+        let files = [
+            make_file(
+                "timestamp.proto",
+                "google.protobuf",
+                vec![msg("Timestamp")],
+                vec![],
+            ),
+            make_file(
+                "test.proto",
+                "protobuf_test_messages.proto3",
+                vec![msg("TestAllTypesProto3")],
+                vec![],
+            ),
+        ];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+
+        // Cross-package: relative via super:: (no common prefix, up 2 levels).
+        assert_eq!(
+            ctx.rust_type_relative(
+                ".google.protobuf.Timestamp",
+                "protobuf_test_messages.proto3",
+                0,
+            ),
+            Some("super::super::google::protobuf::Timestamp".into())
+        );
+    }
+
+    #[test]
+    fn test_relative_nested_type_from_same_package() {
+        // Referencing Outer.Inner from the same package.
+        let outer = msg_with_nested("Outer", vec![msg("Inner")]);
+        let files = [make_file("test.proto", "pkg", vec![outer], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+
+        // Same package: strips the package prefix, keeps module path.
+        assert_eq!(
+            ctx.rust_type_relative(".pkg.Outer.Inner", "pkg", 0),
+            Some("outer::Inner".into())
+        );
+    }
+
+    #[test]
+    fn test_relative_shared_prefix_not_confused() {
+        let files = [
+            make_file("ab.proto", "a.b", vec![msg("Msg1")], vec![]),
+            make_file("abc.proto", "a.bc", vec![msg("Msg2")], vec![]),
+        ];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+
+        // `a.b.Msg1` from `a.bc` context: common prefix "a", up 1, into "b".
+        assert_eq!(
+            ctx.rust_type_relative(".a.b.Msg1", "a.bc", 0),
+            Some("super::b::Msg1".into())
+        );
+        // `a.bc.Msg2` from `a.b` context: common prefix "a", up 1, into "bc".
+        assert_eq!(
+            ctx.rust_type_relative(".a.bc.Msg2", "a.b", 0),
+            Some("super::bc::Msg2".into())
+        );
+    }
+
+    // ── Extern path tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_extern_prefix_exact_match() {
+        let result = resolve_extern_prefix(
+            "my.common",
+            &[(".my.common".into(), "::common_protos".into())],
+        );
+        assert_eq!(result, Some("::common_protos".into()));
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_sub_package() {
+        let result = resolve_extern_prefix(
+            "my.common.sub",
+            &[(".my.common".into(), "::common_protos".into())],
+        );
+        assert_eq!(result, Some("::common_protos::sub".into()));
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_no_match() {
+        let result = resolve_extern_prefix(
+            "other.pkg",
+            &[(".my.common".into(), "::common_protos".into())],
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_partial_name_no_match() {
+        // ".my.common" should not match ".my.commonext"
+        let result = resolve_extern_prefix(
+            "my.commonext",
+            &[(".my.common".into(), "::common_protos".into())],
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_longest_match_wins() {
+        // When multiple prefixes match, the longest one should win.
+        let result = resolve_extern_prefix(
+            "my.common.sub",
+            &[
+                (".my".into(), "::crate_a".into()),
+                (".my.common".into(), "::crate_b".into()),
+            ],
+        );
+        assert_eq!(result, Some("::crate_b::sub".into()));
+    }
+
+    #[test]
+    fn test_extern_path_top_level_message() {
+        let files = [make_file(
+            "common.proto",
+            "my.common",
+            vec![msg("SharedMsg")],
+            vec![],
+        )];
+        let config = CodeGenConfig {
+            extern_paths: vec![(".my.common".into(), "::common_protos".into())],
+            ..Default::default()
+        };
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(
+            ctx.rust_type(".my.common.SharedMsg"),
+            Some("::common_protos::SharedMsg")
+        );
+    }
+
+    #[test]
+    fn test_extern_path_nested_message() {
+        let files = [make_file(
+            "common.proto",
+            "my.common",
+            vec![msg_with_nested("Outer", vec![msg("Inner")])],
+            vec![],
+        )];
+        let config = CodeGenConfig {
+            extern_paths: vec![(".my.common".into(), "::common_protos".into())],
+            ..Default::default()
+        };
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(
+            ctx.rust_type(".my.common.Outer"),
+            Some("::common_protos::Outer")
+        );
+        assert_eq!(
+            ctx.rust_type(".my.common.Outer.Inner"),
+            Some("::common_protos::outer::Inner")
+        );
+    }
+
+    #[test]
+    fn test_extern_path_enum() {
+        let files = [make_file(
+            "common.proto",
+            "my.common",
+            vec![],
+            vec![enum_desc("Status")],
+        )];
+        let config = CodeGenConfig {
+            extern_paths: vec![(".my.common".into(), "::common_protos".into())],
+            ..Default::default()
+        };
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(
+            ctx.rust_type(".my.common.Status"),
+            Some("::common_protos::Status")
+        );
+    }
+
+    #[test]
+    fn test_extern_path_does_not_affect_other_packages() {
+        let files = [
+            make_file("common.proto", "my.common", vec![msg("SharedMsg")], vec![]),
+            make_file(
+                "service.proto",
+                "my.service",
+                vec![msg("MyService")],
+                vec![],
+            ),
+        ];
+        let config = CodeGenConfig {
+            extern_paths: vec![(".my.common".into(), "::common_protos".into())],
+            ..Default::default()
+        };
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // Extern type uses absolute path.
+        assert_eq!(
+            ctx.rust_type(".my.common.SharedMsg"),
+            Some("::common_protos::SharedMsg")
+        );
+        // Non-extern type uses normal package-derived path.
+        assert_eq!(
+            ctx.rust_type(".my.service.MyService"),
+            Some("my::service::MyService")
+        );
+    }
+
+    #[test]
+    fn test_extern_path_relative_returns_absolute() {
+        // When an extern type is referenced from another package,
+        // rust_type_relative should return the full absolute path.
+        let files = [
+            make_file("common.proto", "my.common", vec![msg("SharedMsg")], vec![]),
+            make_file(
+                "service.proto",
+                "my.service",
+                vec![msg("MyService")],
+                vec![],
+            ),
+        ];
+        let config = CodeGenConfig {
+            extern_paths: vec![(".my.common".into(), "::common_protos".into())],
+            ..Default::default()
+        };
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // Cross-package reference to extern type: absolute path.
+        assert_eq!(
+            ctx.rust_type_relative(".my.common.SharedMsg", "my.service", 0),
+            Some("::common_protos::SharedMsg".into())
+        );
+    }
+
+    // ── is_enum_closed tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_is_enum_closed_proto3_default_open() {
+        let files = [make_file("a.proto", "p", vec![], vec![enum_desc("E")])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // proto3 default (make_file has no syntax = proto2/implicit)
+        // actually make_file doesn't set syntax, so it's proto2 default...
+        // proto2 default is CLOSED.
+        assert_eq!(ctx.is_enum_closed(".p.E"), Some(true));
+    }
+
+    #[test]
+    fn test_is_enum_closed_editions_default_open() {
+        let files = [editions_file("a.proto", "p", vec![], vec![enum_desc("E")])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // Edition 2023 default is OPEN.
+        assert_eq!(ctx.is_enum_closed(".p.E"), Some(false));
+    }
+
+    #[test]
+    fn test_is_enum_closed_per_enum_override() {
+        // This is THE bug: enum with `option features.enum_type = CLOSED`
+        // in an otherwise-open editions file must be detected as closed.
+        let files = [editions_file(
+            "a.proto",
+            "p",
+            vec![],
+            vec![enum_desc("Open"), enum_with_closed_feature("Closed")],
+        )];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.is_enum_closed(".p.Open"), Some(false));
+        assert_eq!(ctx.is_enum_closed(".p.Closed"), Some(true));
+    }
+
+    #[test]
+    fn test_is_enum_closed_nested_per_enum_override() {
+        // Feature resolution through file → message → enum.
+        let files = [editions_file(
+            "a.proto",
+            "p",
+            vec![msg_with_nested_and_enums(
+                "M",
+                vec![],
+                vec![enum_with_closed_feature("Inner")],
+            )],
+            vec![],
+        )];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        assert_eq!(ctx.is_enum_closed(".p.M.Inner"), Some(true));
+    }
+
+    #[test]
+    fn test_is_enum_closed_unknown_enum_returns_none() {
+        let files = [editions_file("a.proto", "p", vec![], vec![])];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        // extern_path or missing enum → None (caller falls back).
+        assert_eq!(ctx.is_enum_closed(".other.Unknown"), None);
+    }
+
+    #[test]
+    fn test_for_generate_auto_injects_wkt_mapping() {
+        // for_generate() must produce the same type_map as generate() uses
+        // internally — including the auto-injected WKT extern_path.
+        let ts_msg = DescriptorProto {
+            name: Some("Timestamp".into()),
+            ..Default::default()
+        };
+        let files = [FileDescriptorProto {
+            name: Some("google/protobuf/timestamp.proto".into()),
+            package: Some("google.protobuf".into()),
+            syntax: Some("proto3".into()),
+            message_type: vec![ts_msg],
+            ..Default::default()
+        }];
+        let config = CodeGenConfig::default();
+        // Not generating the WKT file itself → auto-mapping should kick in.
+        let ctx = CodeGenContext::for_generate(&files, &["other.proto".into()], &config);
+        assert_eq!(
+            ctx.rust_type(".google.protobuf.Timestamp"),
+            Some("::buffa_types::google::protobuf::Timestamp"),
+            "WKT auto-mapping must be applied via for_generate"
+        );
+    }
+
+    #[test]
+    fn test_for_generate_suppresses_wkt_when_generating_wkt() {
+        // When files_to_generate includes a google.protobuf file (building
+        // buffa-types itself), the WKT auto-mapping must NOT be applied.
+        let ts_msg = DescriptorProto {
+            name: Some("Timestamp".into()),
+            ..Default::default()
+        };
+        let files = [FileDescriptorProto {
+            name: Some("google/protobuf/timestamp.proto".into()),
+            package: Some("google.protobuf".into()),
+            syntax: Some("proto3".into()),
+            message_type: vec![ts_msg],
+            ..Default::default()
+        }];
+        let config = CodeGenConfig::default();
+        let ctx = CodeGenContext::for_generate(
+            &files,
+            &["google/protobuf/timestamp.proto".into()],
+            &config,
+        );
+        // No extern mapping → local-package path.
+        assert_eq!(
+            ctx.rust_type(".google.protobuf.Timestamp"),
+            Some("google::protobuf::Timestamp")
+        );
+    }
+}

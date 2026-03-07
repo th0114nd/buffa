@@ -1,0 +1,24 @@
+// Proto2 + JSON codegen: closed enums in various containers.
+// Verifies that map_closed_enum / repeated_closed_enum / closed_enum
+// JSON helpers are reachable and work correctly for proto2 schemas.
+
+syntax = "proto2";
+
+package test.p2json;
+
+enum Tier {
+  FREE = 0;
+  PRO = 1;
+  ENTERPRISE = 2;
+}
+
+message ClosedEnumJson {
+  // Singular closed enum (bare Tier, not EnumValue<Tier>).
+  optional Tier tier = 1;
+
+  // Repeated closed enum.
+  repeated Tier tiers = 2;
+
+  // Map value is closed enum — exercises map_closed_enum JSON helper.
+  map<string, Tier> by_name = 3;
+}

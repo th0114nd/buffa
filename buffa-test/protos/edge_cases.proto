@@ -1,0 +1,107 @@
+// Edge cases not covered by the conformance suite for buffa's own codegen:
+// reserved ranges, large/sparse field numbers, explicit packed override,
+// explicit json_name override, non-string map keys, map with enum value,
+// and sub-message merge-vs-replace semantics.
+
+syntax = "proto3";
+
+package test.edge;
+
+// reserved field numbers and names are silently ignored by codegen — this
+// is a compile-only test (if the crate builds, reserved handling is correct).
+message WithReserved {
+  reserved 4, 5, 9 to 11;
+  reserved "old_field", "deprecated_name";
+  int32 id = 1;
+  string name = 2;
+  bool active = 3;
+  int32 after_gap = 12;
+}
+
+// Large/sparse field numbers exercise multi-byte tag encoding.
+// Field 1-15: 1-byte tag. Field 16-2047: 2-byte. Field 2048+: 3-byte.
+// Max valid field number: 2^29 - 1 = 536870911 (5-byte tag).
+message LargeFieldNumbers {
+  int32 small = 15;
+  int32 medium = 16;
+  int32 large = 2048;
+  string max_field = 536870911;
+}
+
+// Explicit [packed = false] in proto3 (proto3 default is packed).
+// Tests that the encoder honours the option, not just the decoder.
+message PackedOverride {
+  repeated int32 default_packed = 1;
+  repeated int32 explicit_unpacked = 2 [packed = false];
+}
+
+// Explicit [packed = false] for fixed-width scalar types.
+// Exercises the unpacked-repeated size-computation path for types with
+// constant per-element size (FIXED32_ENCODED_LEN, FIXED64_ENCODED_LEN,
+// BOOL_ENCODED_LEN) rather than the varint-sized path.
+message UnpackedFixedWidth {
+  repeated float floats = 1 [packed = false];
+  repeated double doubles = 2 [packed = false];
+  repeated fixed32 fx32 = 3 [packed = false];
+  repeated fixed64 fx64 = 4 [packed = false];
+  repeated bool bools = 5 [packed = false];
+}
+
+// Explicit json_name override — protoc normally computes camelCase, but
+// this overrides it. serde rename must use the custom name; parser must
+// accept both the custom json_name and the original proto field name.
+message CustomJsonName {
+  string original_name = 1 [json_name = "customName"];
+  int32 another_field = 2 [json_name = "renamedInt"];
+}
+
+// Map key types other than string. JSON encoding stringifies all keys
+// (proto3 JSON spec); binary encoding is the standard map entry pair.
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  GREEN = 2;
+}
+
+message MapKeyTypes {
+  map<int32, string> int_key = 1;
+  map<int64, string> long_key = 2;
+  map<bool, string> bool_key = 3;
+  // Map with enum VALUE — exercises map_open_enum JSON helper path.
+  map<string, Color> enum_value = 4;
+}
+
+// Map with fixed-width scalar key and value types. Exercises
+// map_element_size_expr for FIXED32/FIXED64/BOOL paths that
+// previously had no test proto shape.
+message MapFixedWidth {
+  map<fixed32, bool> fx32_to_bool = 1;
+  map<fixed64, double> fx64_to_double = 2;
+  map<sfixed32, float> sfx32_to_float = 3;
+}
+
+// Repeated int64/uint64 must serialize as quoted decimal strings in proto3
+// JSON (e.g. ["1","2"]) and accept both quoted and unquoted on deserialize.
+// Repeated float/double must handle NaN/Inf as string tokens.
+// These exercise the proto_seq container module.
+message RepeatedJsonSpecial {
+  repeated int64 longs = 1;
+  repeated uint64 ulongs = 2;
+  repeated float floats = 3;
+  repeated double doubles = 4;
+  // Map with int64 VALUE (non-string key too) — tests proto_map.
+  map<int32, int64> long_values = 5;
+}
+
+// Sub-message merge semantics: when a singular message field appears
+// multiple times on the wire, the second occurrence MERGES into the first
+// (field-by-field), not replace. This is the #1 protobuf interop pitfall.
+message Part {
+  string a = 1;
+  string b = 2;
+  int32 c = 3;
+}
+
+message Whole {
+  Part part = 1;
+}

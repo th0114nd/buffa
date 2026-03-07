@@ -1,0 +1,17 @@
+[package]
+name = "buffa-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+buffa = { workspace = true, features = ["std", "json"] }
+buffa-types = { workspace = true, features = ["json"] }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+buffa-build = { workspace = true }

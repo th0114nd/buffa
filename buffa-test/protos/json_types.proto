@@ -1,0 +1,110 @@
+// Tests JSON code generation: proto3 JSON serialization and deserialization
+// for various field types, oneofs, maps, and enums.
+
+syntax = "proto3";
+
+package test.json;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  GREEN = 2;
+  BLUE = 3;
+}
+
+message Scalar {
+  int32 int32_val = 1;
+  int64 int64_val = 2;
+  uint32 uint32_val = 3;
+  uint64 uint64_val = 4;
+  float float_val = 5;
+  double double_val = 6;
+  bool bool_val = 7;
+  string string_val = 8;
+  bytes bytes_val = 9;
+}
+
+message WithEnum {
+  Color color = 1;
+  repeated Color colors = 2;
+}
+
+message WithOneof {
+  oneof value {
+    string text = 1;
+    int32 number = 2;
+    bool flag = 3;
+  }
+}
+
+// Oneof with one variant per proto3-JSON-special scalar type. Exercises
+// serde_helper_path dispatch in oneof codegen and the corresponding
+// json_helpers::{int64, uint32, uint64, float, double, bytes} runtime paths.
+message WithOneofTypes {
+  oneof kind {
+    int64 i64 = 1;
+    uint32 u32 = 2;
+    uint64 u64 = 3;
+    float f32 = 4;
+    double f64 = 5;
+    bytes b = 6;
+    // NullValue in a oneof → serializes as JSON null.
+    google.protobuf.NullValue nv = 7;
+  }
+}
+
+message WithMap {
+  map<string, string> labels = 1;
+  map<string, int32> counts = 2;
+}
+
+message WithTimestamp {
+  google.protobuf.Timestamp created = 1;
+}
+
+message Nested {
+  Scalar scalar = 1;
+  repeated Scalar items = 2;
+  WithEnum with_enum = 3;
+}
+
+// proto3 `optional` (explicit presence) for each proto3-JSON-special scalar
+// type. Covers optional_serde_module dispatch in message.rs — previously
+// only optional int32/string were tested.
+message OptionalScalars {
+  optional int32 o_i32 = 1;
+  optional uint32 o_u32 = 2;
+  optional int64 o_i64 = 3;
+  optional uint64 o_u64 = 4;
+  optional float o_f32 = 5;
+  optional double o_f64 = 6;
+  optional bytes o_bytes = 7;
+  optional Color o_color = 8;  // open enum → opt_enum helper
+}
+
+// Message with BOTH a oneof AND non-oneof fields of various kinds.
+// Exercises generate_custom_deserialize non-oneof-field paths: when
+// a message has oneofs, a hand-written Deserialize is generated that
+// must also handle regular scalar/repeated/map/message fields.
+message MixedOneofAndFields {
+  // Regular scalar field.
+  int64 id = 1;
+  // Repeated field.
+  repeated string tags = 2;
+  // Map field.
+  map<string, int32> counts = 3;
+  // Message field.
+  Scalar scalar = 4;
+  // google.protobuf.Value field — null-forward semantics.
+  google.protobuf.Value dynamic = 5;
+  // Field with json_name override (json_name != proto name).
+  int32 snake_case_field = 6 [json_name = "snakeCaseField"];
+  // The oneof that triggers custom Deserialize generation.
+  oneof choice {
+    string text = 10;
+    int32 num = 11;
+  }
+}

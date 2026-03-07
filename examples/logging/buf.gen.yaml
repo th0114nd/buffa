@@ -1,0 +1,10 @@
+version: v2
+inputs:
+  - directory: proto
+plugins:
+  - local: protoc-gen-buffa
+    out: src/gen
+    strategy: all
+    opt:
+      - views=false
+      - mod_file=mod.rs

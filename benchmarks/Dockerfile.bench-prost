@@ -1,0 +1,23 @@
+# Build and run prost protobuf benchmarks.
+#
+# Usage:
+#   docker build -t buffa-bench-prost -f benchmarks/Dockerfile.bench-prost .
+#   docker run --rm buffa-bench-prost
+
+FROM rust:1.85-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Copy benchmark shared files and the prost benchmark crate.
+COPY benchmarks/proto/      benchmarks/proto/
+COPY benchmarks/datasets/   benchmarks/datasets/
+COPY benchmarks/prost/      benchmarks/prost/
+
+RUN cargo install cargo-criterion \
+    && cargo bench --manifest-path benchmarks/prost/Cargo.toml --no-run
+
+ENTRYPOINT ["cargo", "criterion", "--manifest-path", "benchmarks/prost/Cargo.toml", "--bench", "protobuf", "--message-format=json", "--", "--warm-up-time", "3", "--measurement-time", "5"]

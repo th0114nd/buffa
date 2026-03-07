@@ -1,0 +1,37 @@
+# Build and run Go protojson benchmarks.
+#
+# Usage:
+#   docker build -t buffa-bench-go -f benchmarks/Dockerfile.bench-go .
+#   docker run --rm buffa-bench-go
+
+FROM golang:1.23-bookworm
+
+RUN apt-get update && apt-get install -y protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
+
+WORKDIR /workspace
+
+COPY benchmarks/proto/      benchmarks/proto/
+COPY benchmarks/datasets/   benchmarks/datasets/
+COPY benchmarks/go/          benchmarks/go/
+
+WORKDIR /workspace/benchmarks/go
+
+# Generate Go protobuf code from the shared .proto definitions.
+# The .proto files lack go_package options, so we set them via M flags.
+RUN mkdir -p gen/bench gen/benchmarks gen/proto3 && \
+    protoc --go_out=gen/bench --go_opt=paths=source_relative \
+        --go_opt=Mbench_messages.proto=github.com/anthropics/buffa/benchmarks/go/gen/bench \
+        -I ../proto ../proto/bench_messages.proto && \
+    protoc --go_out=gen/benchmarks --go_opt=paths=source_relative \
+        --go_opt=Mbenchmarks.proto=github.com/anthropics/buffa/benchmarks/go/gen/benchmarks \
+        -I ../proto ../proto/benchmarks.proto && \
+    protoc --go_out=gen/proto3 --go_opt=paths=source_relative \
+        --go_opt=Mbenchmark_message1_proto3.proto=github.com/anthropics/buffa/benchmarks/go/gen/proto3 \
+        -I ../proto ../proto/benchmark_message1_proto3.proto
+
+# Download dependencies and generate go.sum.
+RUN go mod tidy && go mod download
+
+ENTRYPOINT ["go", "test", "-bench=.", "-benchmem", "-benchtime=5s", "./..."]

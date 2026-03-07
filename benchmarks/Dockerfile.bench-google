@@ -1,0 +1,37 @@
+# Build and run Google protobuf-v4 benchmarks.
+#
+# The protobuf v4 Rust crate wraps the upb C library and requires:
+#   - protoc matching the crate version (33.1 for protobuf = 4.33.1-release)
+#   - cmake + g++ for the upb native build
+#
+# Usage:
+#   docker build -t buffa-bench-google -f benchmarks/Dockerfile.bench-google .
+#   docker run --rm buffa-bench-google
+
+FROM rust:1.85-slim AS builder
+
+# Install build tools: cmake and g++ for upb, curl/unzip for protoc download.
+RUN apt-get update && apt-get install -y \
+    cmake g++ pkg-config curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install protoc 33.1 (must match protobuf crate version 4.33.1-release).
+ARG TARGETARCH
+RUN ARCH=$(case "$TARGETARCH" in arm64) echo aarch_64;; *) echo x86_64;; esac) \
+    && curl -sL "https://github.com/protocolbuffers/protobuf/releases/download/v33.1/protoc-33.1-linux-${ARCH}.zip" \
+       -o /tmp/protoc.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc \
+    && rm /tmp/protoc.zip \
+    && protoc --version
+
+WORKDIR /workspace
+
+# Copy benchmark shared files and the google benchmark crate.
+COPY benchmarks/proto/      benchmarks/proto/
+COPY benchmarks/datasets/   benchmarks/datasets/
+COPY benchmarks/google/     benchmarks/google/
+
+RUN cargo install cargo-criterion \
+    && cargo bench --manifest-path benchmarks/google/Cargo.toml --no-run
+
+ENTRYPOINT ["cargo", "criterion", "--manifest-path", "benchmarks/google/Cargo.toml", "--bench", "protobuf", "--message-format=json", "--", "--warm-up-time", "3", "--measurement-time", "5"]

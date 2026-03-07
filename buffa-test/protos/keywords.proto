@@ -1,0 +1,60 @@
+// Tests Rust keyword handling in proto package names, message names,
+// field names, and enum values.
+
+syntax = "proto3";
+
+package test.keywords;
+
+// Message named after a Rust keyword — produces `pub mod r#type { ... }`.
+message Type {
+  string name = 1;
+
+  // Nested enum inside a keyword-named message.
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_PRIMITIVE = 1;
+    KIND_COMPOSITE = 2;
+  }
+
+  Kind kind = 2;
+
+  // Self-referential field (recursive type).
+  Type nested = 3;
+}
+
+// Another keyword-named message.
+message Struct {
+  map<string, string> fields = 1;
+}
+
+// Message with fields that are Rust keywords.
+message KeywordFields {
+  string type = 1;
+  int32 match = 2;
+  bool async = 3;
+  string self = 4;
+  bytes mod = 5;
+  double fn = 6;
+  string super = 7;
+}
+
+// Enum with keyword values (these become PascalCase variants, so less
+// problematic, but the snake_case field accessor uses the original name).
+enum Match {
+  MATCH_UNSPECIFIED = 0;
+  MATCH_EXACT = 1;
+  MATCH_PREFIX = 2;
+}
+
+// Message referencing keyword-named types from the same package.
+message Expression {
+  Type result_type = 1;
+  Struct attributes = 2;
+  Match match_mode = 3;
+
+  // Oneof with a keyword-named message variant.
+  oneof value {
+    string literal = 4;
+    Type type_ref = 5;
+  }
+}

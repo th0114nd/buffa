@@ -1,0 +1,27 @@
+// Tests cross-package type references. This file imports types from
+// basic.proto (package "basic") and nested_deep.proto (package "test.nested").
+
+syntax = "proto3";
+
+package test.cross;
+
+import "basic.proto";
+import "nested_deep.proto";
+
+// References types from other packages.
+message Composite {
+  // Reference to a type in "basic" package.
+  basic.Person person = 1;
+  basic.Address address = 2;
+  basic.Status status = 3;
+
+  // Reference to a deeply nested type in "test.nested" package.
+  test.nested.TreeNode tree = 4;
+  test.nested.Outer.Middle.Inner detail = 5;
+
+  // Map with cross-package message values.
+  map<string, basic.Address> address_book = 6;
+
+  // Repeated cross-package message.
+  repeated test.nested.TreeNode nodes = 7;
+}

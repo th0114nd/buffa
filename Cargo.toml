@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "buffa",
+    "buffa-types",
+    "buffa-codegen",
+    "buffa-build",
+    "buffa-test",
+    "protoc-gen-buffa",
+]
+exclude = [
+    "benchmarks/gen-datasets",
+    "benchmarks/buffa",
+    "benchmarks/prost",
+    "benchmarks/google",
+    "benchmarks/go",
+    "examples/addressbook",
+    "examples/logging",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/anthropics/buffa"
+keywords = ["protobuf", "protocol-buffers", "serialization", "no-std", "editions"]
+categories = ["encoding", "no-std"]
+
+[workspace.dependencies]
+buffa = { path = "buffa", version = "0.1.0", default-features = false }
+buffa-types = { path = "buffa-types", version = "0.1.0" }
+buffa-codegen = { path = "buffa-codegen", version = "0.1.0" }
+buffa-build = { path = "buffa-build", version = "0.1.0" }
+buffa-test = { path = "buffa-test", version = "0.1.0" }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+bytes = { version = "1", default-features = false }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+once_cell = { version = "1", default-features = false }
+serde = { version = "1", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+arbitrary = { version = "1", default-features = false, features = ["derive"] }
+thiserror = { version = "2", default-features = false }
+prettyplease = "0.2"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

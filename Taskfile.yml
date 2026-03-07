@@ -1,0 +1,536 @@
+version: '3'
+
+vars:
+  TOOLS_IMAGE:
+    sh: echo "${TOOLS_IMAGE:-ghcr.io/anthropics/buffa/tools:v33.5}"
+  CONFORMANCE_IMAGE:
+    sh: echo "${CONFORMANCE_IMAGE:-buffa-conformance}"
+  # Platforms for the multi-arch tools image push.
+  PLATFORMS:
+    sh: echo "${PLATFORMS:-linux/amd64,linux/arm64}"
+  # Auto-detect the local machine's architecture for single-platform builds.
+  LOCAL_PLATFORM:
+    sh: echo "linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+
+tasks:
+
+  # ── Conformance test runner ─────────────────────────────────────────────
+
+  tools-image:
+    desc: >-
+      Build the protobuf tools image for all platforms and push to the registry.
+      Requires a multi-platform buildx builder — create one with:
+        docker buildx create --name multiarch --driver docker-container --use
+      Slow (~10–20 min); only needed when the protobuf version changes.
+    cmds:
+      - docker buildx build
+          --platform {{.PLATFORMS}}
+          -t {{.TOOLS_IMAGE}}
+          --push
+          -f conformance/Dockerfile.tools
+          .
+
+  tools-image-local:
+    desc: >-
+      Build the tools image for the local machine only and load it into the
+      Docker daemon. Faster than a full multi-platform push; use for testing.
+    cmds:
+      - docker buildx build
+          --platform {{.LOCAL_PLATFORM}}
+          -t {{.TOOLS_IMAGE}}
+          --load
+          -f conformance/Dockerfile.tools
+          .
+
+  fetch-protos:
+    desc: >-
+      Extract .proto files from the tools image into conformance/protos/.
+      Required before building the conformance crate outside Docker.
+    cmds:
+      - scripts/fetch-protos.sh {{.TOOLS_IMAGE}}
+
+  conformance-image:
+    desc: >-
+      Build the conformance test image (tools runner + our buffa binary).
+      The tools image must be present locally or pullable from the registry.
+    cmds:
+      - docker build
+          -t {{.CONFORMANCE_IMAGE}}
+          --build-arg TOOLS_IMAGE={{.TOOLS_IMAGE}}
+          -f conformance/Dockerfile
+          .
+
+  conformance:
+    desc: Run the protobuf conformance test suite.
+    deps: [conformance-image]
+    cmds:
+      - docker run --rm {{.CONFORMANCE_IMAGE}}
+
+  conformance-full:
+    desc: >-
+      Build the tools image locally then run the full conformance suite.
+      Use this the first time or after updating the protobuf version.
+    deps: [tools-image-local, conformance]
+
+  conformance-failures:
+    desc: >-
+      Run the conformance suite without a failure list and print all
+      failing test names, sorted.  Use this to regenerate
+      conformance/known_failures.txt after fixing tests.
+    deps: [conformance-image]
+    cmds:
+      - >-
+        docker run --rm
+        --entrypoint conformance_test_runner
+        {{.CONFORMANCE_IMAGE}}
+        /usr/local/bin/buffa-conformance
+        2>&1
+        | grep '^ERROR'
+        | sed 's/^ERROR, test=\([^:]*\):.*/\1/'
+        | sort
+
+  # ── Development helpers ─────────────────────────────────────────────────
+
+  install-protoc:
+    desc: >-
+      Download protoc (version-matched to TOOLS_IMAGE) into .local/ via
+      gh release download. Use when the system protoc is too old (e.g. for
+      edition 2024 tests). After install, run tests via:
+        task test-local  (sets PROTOC for you)
+    vars:
+      PROTO_VER:
+        sh: echo "{{.TOOLS_IMAGE}}" | sed 's/.*:v//'
+      # Protobuf release asset naming: linux/osx, and aarch_64 (underscore!).
+      PROTOC_OS:
+        sh: uname -s | sed 's/Linux/linux/;s/Darwin/osx/'
+      PROTOC_ARCH:
+        sh: uname -m | sed 's/aarch64/aarch_64/;s/arm64/aarch_64/'
+    status:
+      # Version-aware: re-downloads if TOOLS_IMAGE is bumped.
+      - .local/bin/protoc --version 2>/dev/null | grep -qF "{{.PROTO_VER}}"
+    preconditions:
+      - sh: gh auth status
+        msg: >-
+          gh CLI must be authenticated. Run: gh auth login
+    cmds:
+      - rm -rf .local/bin .local/include
+      - mkdir -p .local
+      - gh release download 'v{{.PROTO_VER}}'
+          --repo protocolbuffers/protobuf
+          --pattern 'protoc-*-{{.PROTOC_OS}}-{{.PROTOC_ARCH}}.zip'
+          --output /tmp/protoc-install.zip
+          --clobber
+      - unzip -oq /tmp/protoc-install.zip -d .local
+      - rm -f /tmp/protoc-install.zip
+      - chmod +x .local/bin/protoc
+      - .local/bin/protoc --version
+
+  test-local:
+    desc: >-
+      Run the workspace test suite using the .local/ protoc (from
+      install-protoc). Ensures edition 2024 tests run even when system
+      protoc is too old.
+    deps: [install-protoc]
+    env:
+      PROTOC: '{{.ROOT_DIR}}/.local/bin/protoc'
+    cmds:
+      - cargo test --workspace
+
+  verify:
+    desc: >-
+      Run the full pre-commit verification pipeline: clippy, markdownlint,
+      tests, then conformance suite.  Stops on first failure.
+    cmds:
+      - task: lint
+      - task: lint-md
+      - task: test
+      - task: conformance
+
+  test:
+    desc: Run the workspace test suite.
+    cmds:
+      - cargo test --workspace
+
+  test-codegen:
+    desc: >-
+      Run codegen integration tests that invoke protoc on real .proto files.
+      Requires protoc on PATH (install via your package manager or set PROTOC).
+    preconditions:
+      - sh: which protoc || which $PROTOC
+        msg: >-
+          protoc is required for codegen integration tests.
+          Install it via your package manager:
+            brew install protobuf    # macOS
+            apt install protobuf-compiler  # Debian/Ubuntu
+            nix-env -i protobuf      # Nix
+          Or set PROTOC=/path/to/protoc
+    cmds:
+      - cargo test -p buffa-codegen --test codegen_integration
+
+  lint:
+    desc: Run clippy across the workspace with warnings as errors.
+    cmds:
+      - cargo clippy --workspace -- -D warnings
+
+  lint-md:
+    desc: >-
+      Run markdownlint over all Markdown files using .markdownlint.json.
+      Pinned to markdownlint-cli@0.47.0 for deterministic results; npx
+      caches the package after first run.
+    preconditions:
+      - sh: which npx
+        msg: >-
+          npx is required for markdownlint. Install Node.js:
+            brew install node        # macOS
+            apt install nodejs npm   # Debian/Ubuntu
+    cmds:
+      - npx --yes markdownlint-cli@0.47.0 '**/*.md' --ignore target --ignore .claude
+
+  check-keywords:
+    desc: >-
+      Compare is_rust_keyword in buffa-codegen against the current Rust keyword
+      list fetched from the rust-lang/rust stable branch on GitHub.
+      Requires internet access; no local toolchain configuration needed.
+    cmds:
+      - python3 scripts/check-keywords.py
+
+  # ── Fuzz testing ─────────────────────────────────────────────────────
+
+  fuzz:
+    desc: >-
+      Run a single fuzz target. Requires nightly Rust and cargo-fuzz.
+      Usage: task fuzz -- <target> [-- libfuzzer-args]
+      Targets: decode_proto3, decode_proto2, decode_wkt, json_roundtrip,
+      encode_proto3, wkt_json_strings
+    cmds:
+      - cargo +nightly fuzz run --fuzz-dir fuzz {{.CLI_ARGS}}
+
+  fuzz-all:
+    desc: >-
+      Run all fuzz targets in parallel with logs to /tmp/buffa-fuzz/.
+      Prints periodic progress summaries (every 5 min).
+      Usage: task fuzz-all [-- max_total_time_secs]
+      Default: 28800 (8 hours).
+    cmds:
+      - scripts/fuzz-all.sh {{.CLI_ARGS}}
+
+  # ── Plugin image ──────────────────────────────────────────────────────
+
+  plugin-image:
+    desc: >-
+      Build the protoc-gen-buffa Docker image for the Buf Schema Registry.
+      Targets linux/amd64 as required by BSR. Push with:
+        buf beta registry plugin push --visibility public --image protoc-gen-buffa
+    cmds:
+      - docker build --platform linux/amd64
+          -t protoc-gen-buffa
+          -f protoc-gen-buffa/Dockerfile
+          .
+
+  # ── Benchmarks ────────────────────────────────────────────────────
+  #
+  # The primary `bench` target runs buffa-only benchmarks natively (no
+  # Docker). Criterion automatically compares against the previous run
+  # stored in benchmarks/buffa/target/criterion/, showing per-benchmark
+  # regression/improvement. Use this for dev-loop regression checking.
+  #
+  # For cross-implementation comparison (buffa vs prost vs google vs Go),
+  # use `bench-cross` which runs all implementations in Docker for
+  # environment consistency. Slower (~20 min with builds) but necessary
+  # for fair comparison since each impl has different toolchain deps.
+
+  gen-datasets:
+    desc: >-
+      Regenerate benchmark datasets from the gen-datasets binary. Uses a fixed
+      RNG seed, so api_response.pb and analytics_event.pb are byte-reproducible.
+      log_record.pb is NOT — its map<string,string> field encodes in HashMap
+      iteration order (random per process). Don't commit log_record.pb churn
+      unless the schema or generator logic changed.
+    dir: benchmarks/gen-datasets
+    cmds:
+      - cargo run
+
+  bench:
+    desc: >-
+      Run buffa benchmarks natively. Criterion compares against the
+      previous run automatically (see "change:" lines in output).
+      Pass a filter to run a subset: task bench -- log_record
+    dir: benchmarks/buffa
+    cmds:
+      - cargo bench -- {{.CLI_ARGS}}
+
+  bench-save-baseline:
+    desc: >-
+      Save the current native benchmark results as a named criterion
+      baseline. Future `task bench` runs compare against this.
+      Usage: task bench-save-baseline -- <name>  (e.g. "main" or "pre-refactor")
+    dir: benchmarks/buffa
+    cmds:
+      - cargo bench -- --save-baseline {{.CLI_ARGS}}
+
+  bench-compare:
+    desc: >-
+      Run benchmarks and compare against a named baseline.
+      Usage: task bench-compare -- <baseline-name>
+    dir: benchmarks/buffa
+    cmds:
+      - cargo bench -- --baseline {{.CLI_ARGS}}
+
+  bench-prost:
+    desc: >-
+      Run prost benchmarks natively (same machine as `task bench`, so
+      directly comparable). Use this for buffa-vs-prost regression checks.
+    dir: benchmarks/prost
+    cmds:
+      - cargo bench -- {{.CLI_ARGS}}
+
+  # ── Cross-implementation comparison (Docker) ───────────────────────
+  #
+  # Docker is required for google-rs (needs cmake + specific protoc 33.1)
+  # and go (needs go toolchain + protoc-gen-go). Expect ±5-15% noise
+  # from container overhead — use native `task bench` / `task bench-prost`
+  # for precise buffa/prost comparison.
+  # comparison would require polluting the host with all of these.
+
+  bench-cross-buffa:
+    desc: Run buffa benchmarks in Docker (for bench-cross).
+    cmds:
+      - docker build -t buffa-bench-buffa -f benchmarks/Dockerfile.bench-buffa .
+      - docker run --rm buffa-bench-buffa
+
+  bench-cross-prost:
+    desc: Run prost benchmarks in Docker (for bench-cross).
+    cmds:
+      - docker build -t buffa-bench-prost -f benchmarks/Dockerfile.bench-prost .
+      - docker run --rm buffa-bench-prost
+
+  bench-cross-google:
+    desc: Run Google protobuf-v4 benchmarks in Docker (for bench-cross).
+    cmds:
+      - docker build -t buffa-bench-google -f benchmarks/Dockerfile.bench-google .
+      - docker run --rm buffa-bench-google
+
+  bench-cross-go:
+    desc: Run Go protojson benchmarks in Docker (for bench-cross).
+    cmds:
+      - docker build -t buffa-bench-go -f benchmarks/Dockerfile.bench-go .
+      - docker run --rm buffa-bench-go
+
+  bench-cross:
+    desc: >-
+      Run all benchmarks (buffa, prost, google, go) in Docker and save
+      results to benchmarks/results/ for cross-implementation comparison.
+      Slow (~20 min including Docker builds). Use `task bench` for
+      fast dev-loop regression checking.
+    cmds:
+      - mkdir -p benchmarks/results
+      - rm -rf benchmarks/results/criterion-buffa benchmarks/results/criterion-prost
+      - |
+        echo "Running buffa benchmarks..."
+        docker build -t buffa-bench-buffa -f benchmarks/Dockerfile.bench-buffa .
+        CID=$(docker create buffa-bench-buffa)
+        docker start -a "$CID" > benchmarks/results/buffa.json
+        docker cp "$CID:/workspace/benchmarks/buffa/target/criterion/." benchmarks/results/criterion-buffa/ || echo "(criterion extract failed)"
+        docker rm "$CID" > /dev/null
+      - |
+        echo "Running prost benchmarks..."
+        docker build -t buffa-bench-prost -f benchmarks/Dockerfile.bench-prost .
+        CID=$(docker create buffa-bench-prost)
+        docker start -a "$CID" > benchmarks/results/prost.json
+        docker cp "$CID:/workspace/benchmarks/prost/target/criterion/." benchmarks/results/criterion-prost/ || echo "(criterion extract failed)"
+        docker rm "$CID" > /dev/null
+      - |
+        echo "Running google benchmarks..."
+        docker build -t buffa-bench-google -f benchmarks/Dockerfile.bench-google .
+        CID=$(docker create buffa-bench-google)
+        docker start -a "$CID" > benchmarks/results/google.json
+        docker rm "$CID" > /dev/null
+      - |
+        echo "Running Go benchmarks..."
+        docker build -t buffa-bench-go -f benchmarks/Dockerfile.bench-go .
+        docker run --rm buffa-bench-go 2>&1 | tee benchmarks/results/go.txt
+      - |
+        echo ""
+        echo "Results saved to benchmarks/results/"
+        echo "Run 'task bench-charts' to generate comparison charts."
+
+  bench-charts:
+    desc: >-
+      Generate SVG charts and README tables from saved benchmark results
+      in benchmarks/results/. Run bench-cross first.
+    cmds:
+      - python3 benchmarks/charts/generate.py benchmarks/results/
+
+  # ── Compatibility tests ──────────────────────────────────────────────
+
+  protoc-compat:
+    desc: >-
+      Test protoc-gen-buffa against multiple protoc versions (v21–v33) to
+      verify plugin protocol compatibility. Runs in Docker.
+    cmds:
+      - docker build -t buffa-protoc-compat -f compat/Dockerfile .
+      - docker run --rm buffa-protoc-compat
+
+  # ── Stress tests ─────────────────────────────────────────────────────
+
+  stress-googleapis:
+    desc: >-
+      Generate Rust code for the entire Google Cloud APIs proto set (~thousands
+      of .proto files) to stress-test codegen. Use -v to mount output:
+        task stress-googleapis -- -v ./stress/googleapis/out:/out
+    cmds:
+      - docker build -t buffa-stress-googleapis -f stress/googleapis/Dockerfile .
+      - docker run --rm {{.CLI_ARGS}} buffa-stress-googleapis
+
+  # ── Checked-in generated code ─────────────────────────────────────────
+  #
+  # Two sets of generated code are checked into the repo:
+  #   - buffa-codegen/src/generated/  (bootstrap descriptor types)
+  #   - buffa-types/src/generated/    (well-known types)
+  # CI (check-generated-code) fails if either is stale.
+
+  gen-bootstrap-types:
+    desc: >-
+      Regenerate buffa-codegen/src/generated/ (descriptor.proto + plugin.proto
+      types used by codegen itself to parse descriptors). Only needed when a
+      codegen change affects the descriptor types themselves — most codegen
+      changes don't. Proto sources are vendored in buffa-codegen/protos/;
+      only a protoc binary (v27+) is required.
+    cmds:
+      - scripts/gen-bootstrap-types.sh
+
+  vendor-bootstrap-protos:
+    desc: >-
+      Re-fetch buffa-codegen/protos/ from the protobuf release matching
+      TOOLS_IMAGE. Run this when bumping the protobuf version, then follow
+      with `task gen-bootstrap-types` and commit both. Uses gh (authenticated
+      API) rather than raw curl to avoid GitHub's anonymous rate limit.
+    vars:
+      PROTO_VER:
+        sh: echo "{{.TOOLS_IMAGE}}" | sed 's/.*:v//'
+      GH_RAW: gh api -H "Accept:application/vnd.github.raw"
+      SRC: repos/protocolbuffers/protobuf/contents/src/google/protobuf
+    preconditions:
+      - sh: gh auth status
+        msg: >-
+          gh CLI must be authenticated. Run: gh auth login
+    cmds:
+      - echo "Vendoring descriptor.proto + plugin.proto from protobuf v{{.PROTO_VER}}"
+      - mkdir -p buffa-codegen/protos/google/protobuf/compiler
+      - >-
+        {{.GH_RAW}} '{{.SRC}}/descriptor.proto?ref=v{{.PROTO_VER}}'
+        > buffa-codegen/protos/google/protobuf/descriptor.proto
+      - >-
+        {{.GH_RAW}} '{{.SRC}}/compiler/plugin.proto?ref=v{{.PROTO_VER}}'
+        > buffa-codegen/protos/google/protobuf/compiler/plugin.proto
+      - wc -l buffa-codegen/protos/google/protobuf/descriptor.proto
+          buffa-codegen/protos/google/protobuf/compiler/plugin.proto
+
+  gen-wkt-types:
+    desc: >-
+      Regenerate buffa-types/src/generated/ (Timestamp, Duration, Any, etc.).
+      Run this after any codegen change that affects output format.
+      Requires protoc on PATH.
+    cmds:
+      - >-
+        protoc --descriptor_set_out=/tmp/wkt.pb --include_imports
+        -I buffa-types/protos
+        google/protobuf/any.proto
+        google/protobuf/duration.proto
+        google/protobuf/empty.proto
+        google/protobuf/field_mask.proto
+        google/protobuf/struct.proto
+        google/protobuf/timestamp.proto
+        google/protobuf/wrappers.proto
+      - cargo run -p buffa-codegen --bin gen_wkt_types -- /tmp/wkt.pb buffa-types/src/generated
+
+  # ── Examples ──────────────────────────────────────────────────────────
+
+  gen-logging-example:
+    desc: >-
+      Regenerate the logging example's protobuf code using buf generate
+      and protoc-gen-buffa. Requires a release build of protoc-gen-buffa
+      and buf on PATH.
+    deps: [build-plugin]
+    dir: examples/logging
+    cmds:
+      - rm -f src/gen/context.v1.context.rs src/gen/log.v1.log.rs src/gen/mod.rs
+      - PATH="{{.ROOT_DIR}}/target/release:$PATH" buf generate
+
+  build-plugin:
+    desc: Build protoc-gen-buffa in release mode.
+    cmds:
+      - cargo build --release --bin protoc-gen-buffa
+    sources:
+      - buffa-codegen/src/**/*.rs
+      - protoc-gen-buffa/src/**/*.rs
+    generates:
+      - target/release/protoc-gen-buffa
+
+  # ── Cross-target checks ─────────────────────────────────────────
+
+  install-targets:
+    desc: >-
+      Install the additional rustup targets required by cross-target
+      check and test tasks (i686-unknown-linux-gnu, thumbv7em-none-eabihf).
+    cmds:
+      - rustup target add i686-unknown-linux-gnu thumbv7em-none-eabihf
+
+  check-32bit:
+    desc: >-
+      Check that the workspace compiles for 32-bit x86 Linux.
+    preconditions:
+      - sh: rustup target list --installed | grep -q i686-unknown-linux-gnu
+        msg: >-
+          Target i686-unknown-linux-gnu is not installed.
+          Run 'task install-targets' to install it.
+    cmds:
+      - cargo check --workspace --target i686-unknown-linux-gnu
+
+  test-32bit:
+    desc: >-
+      Build and run the workspace test suite on 32-bit x86 Linux.
+      Also requires gcc-multilib for cross-compilation linking.
+    preconditions:
+      - sh: rustup target list --installed | grep -q i686-unknown-linux-gnu
+        msg: >-
+          Target i686-unknown-linux-gnu is not installed.
+          Run 'task install-targets' to install it.
+    cmds:
+      - cargo test --workspace --target i686-unknown-linux-gnu
+
+  check-nostd:
+    desc: >-
+      Check that buffa compiles in no_std + alloc configuration.
+      The first check uses the host target with no_std features disabled.
+      The second check targets a bare-metal ARM Cortex-M4 (thumbv7em)
+      to verify true no_std compatibility with no OS or libc.
+    preconditions:
+      - sh: rustup target list --installed | grep -q thumbv7em-none-eabihf
+        msg: >-
+          Target thumbv7em-none-eabihf is not installed.
+          Run 'task install-targets' to install it.
+    cmds:
+      - cargo check -p buffa --no-default-features
+      - cargo check -p buffa --no-default-features --target thumbv7em-none-eabihf
+  # ── Coverage ─────────────────────────────────────────────────────────
+
+  coverage:
+    desc: Generate a line-coverage summary for the workspace.
+    vars:
+      IGNORE: "--ignore-filename-regex 'generated/|gen_descriptor_types|gen_wkt_types'"
+    cmds:
+      - cargo llvm-cov --workspace --features buffa/json {{.IGNORE}} --include-build-script --summary-only
+
+  coverage-html:
+    desc: Generate an HTML coverage report and open it in the browser.
+    vars:
+      IGNORE: "--ignore-filename-regex 'generated/|gen_descriptor_types|gen_wkt_types'"
+    cmds:
+      - cargo llvm-cov --workspace --features buffa/json {{.IGNORE}} --include-build-script --open
+
+  clean:
+    desc: Remove build artefacts and fetched proto files.
+    cmds:
+      - cargo clean
+      - rm -rf conformance/protos/

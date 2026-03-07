@@ -1,0 +1,53 @@
+// Per-enum enum_type feature overrides in JSON contexts.
+//
+// Edition 2023 default is enum_type = OPEN. This file verifies that
+// per-enum CLOSED overrides are respected by the JSON serde-module
+// selector, not just the Rust type resolver.
+//
+// Background: commit 55ca457 fixed type resolution to consult the
+// referenced enum's own features (via ctx.is_enum_closed) rather than
+// the referencing field's features. That fix covered ~15 entry points
+// in the binary codec, but the JSON serde-module selector for map
+// values (map_serde_module) was missed — it still reads enum_type from
+// the MAP FIELD's features (TYPE_MESSAGE → no overlay → file default
+// OPEN) while the type resolver correctly produces bare `E` (closed).
+// Result: map_enum (expects HashMap<K, EnumValue<E>>) on a field typed
+// HashMap<K, E> → compile error.
+//
+// Compilable with protoc v27+ (unlike editions_2024.proto which needs v30+).
+
+edition = "2023";
+
+package test.edenumjson;
+
+// File default: OPEN. Per-enum override to CLOSED.
+enum ClosedFlavour {
+  option features.enum_type = CLOSED;
+  FLAVOUR_UNSPECIFIED = 0;
+  FLAVOUR_VANILLA = 1;
+  FLAVOUR_CHOCOLATE = 2;
+}
+
+// Control: file default OPEN, no override.
+enum OpenFlavour {
+  OPEN_UNSPECIFIED = 0;
+  OPEN_STRAWBERRY = 1;
+}
+
+message EnumJsonContexts {
+  // Singular, repeated, optional: exercised by editions_2024.proto (binary)
+  // and proto2_json.proto (JSON). Included here as compile-time sanity only.
+  ClosedFlavour singular = 1;
+  repeated ClosedFlavour many = 2;
+
+  // The bug: map value. Type is HashMap<String, ClosedFlavour> (bare, closed)
+  // but serde module was map_enum (expects EnumValue<E>).
+  map<string, ClosedFlavour> by_key = 3;
+
+  // Non-string key + closed enum value. Also verifies bughunter's Issue 1
+  // is a false positive — serde_json auto-stringifies int keys.
+  map<int32, ClosedFlavour> by_id = 4;
+
+  // Control: open enum map value (file default) → map_enum is correct.
+  map<string, OpenFlavour> open_by_key = 5;
+}

@@ -1,0 +1,6 @@
+version: v2
+plugins:
+  - local: protoc-gen-buffa
+    out: gen
+    opt:
+      - views=true

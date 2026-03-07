@@ -1,0 +1,84 @@
+// Tests edition 2024 end-to-end: full protoc -> descriptor -> codegen
+// -> compile -> runtime pipeline, exercising per-field feature overrides.
+// Edition 2024 shares default feature values with 2023 in protobuf v29+,
+// but this verifies the edition marker itself is handled and that
+// feature resolution works at file/message/field scope.
+
+edition = "2024";
+
+package test.ed2024;
+
+// File-level feature: enable packed encoding by default (matches proto3).
+option features.repeated_field_encoding = PACKED;
+
+message EditionTest {
+  // Implicit presence (edition 2023/2024 default is EXPLICIT, override it).
+  int32 implicit_int = 1 [features.field_presence = IMPLICIT];
+
+  // Explicit presence (the edition default).
+  int32 explicit_int = 2;
+
+  // Repeated with the file-level PACKED default.
+  repeated int32 packed_ints = 3;
+
+  // Repeated with a field-level override to EXPANDED (unpacked).
+  repeated int32 expanded_ints = 4 [features.repeated_field_encoding = EXPANDED];
+
+  // Message sub-field.
+  SubMessage sub = 5;
+
+  string text = 6;
+}
+
+message SubMessage {
+  string value = 1;
+}
+
+// Open enum (edition 2023/2024 default).
+enum OpenStatus {
+  OPEN_UNSPECIFIED = 0;
+  OPEN_ACTIVE = 1;
+}
+
+// Closed enum via per-enum feature override. Prior to commit 4e4e15d this
+// was incorrectly emitted as EnumValue<ClosedStatus> because is_closed_enum
+// checked the FIELD's features, not the referenced ENUM's features. protoc
+// does not propagate enum-level enum_type into the field descriptor.
+enum ClosedStatus {
+  option features.enum_type = CLOSED;
+  CLOSED_UNSPECIFIED = 0;
+  CLOSED_ACTIVE = 1;
+}
+
+// Nested closed enum — verifies feature resolution through file → msg → enum.
+message EnumContainer {
+  enum NestedClosed {
+    option features.enum_type = CLOSED;
+    NESTED_UNSPECIFIED = 0;
+    NESTED_VALUE = 1;
+  }
+}
+
+message WithEnums {
+  OpenStatus open_status = 1;
+  ClosedStatus closed_status = 2;
+  repeated ClosedStatus closed_repeated = 3;
+  map<string, ClosedStatus> closed_map = 4;
+  EnumContainer.NestedClosed nested_closed = 5;
+}
+
+// LEGACY_REQUIRED is editions' spelling of proto2 `required`. Must produce
+// bare types (not Option<T>) and always encode regardless of value (zero/empty).
+message WithLegacyRequired {
+  int32 req_int = 1 [features.field_presence = LEGACY_REQUIRED];
+  string req_str = 2 [features.field_presence = LEGACY_REQUIRED];
+  int32 opt_int = 3;  // control: edition-default EXPLICIT = Option<i32>
+}
+
+// LEGACY_REQUIRED with a custom default. Must emit a hand-written impl
+// Default even though the message-level default presence is EXPLICIT (where
+// normally all fields are Option<T> and custom defaults are ignored).
+message LegacyReqDefault {
+  int32 req = 1 [features.field_presence = LEGACY_REQUIRED, default = 42];
+}
+

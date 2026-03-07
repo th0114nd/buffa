@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="471" viewBox="0 0 800 471">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .title { font-size: 16px; font-weight: 600; fill: #24292f; }
+    .label { font-size: 12px; fill: #24292f; }
+    .value { font-size: 11px; fill: #57606a; }
+    .axis-label { font-size: 11px; fill: #57606a; }
+    .legend-text { font-size: 12px; fill: #24292f; }
+    .grid { stroke: #d0d7de; stroke-width: 0.5; }
+  </style>
+  <rect width="100%" height="100%" fill="white"/>
+  <text x="400.0" y="25" text-anchor="middle" class="title">JSON Encode Throughput</text>
+  <rect x="140" y="35" width="14" height="14" rx="2" fill="#4C78A8"/>
+  <text x="158" y="46" class="legend-text">buffa</text>
+  <rect x="209.5" y="35" width="14" height="14" rx="2" fill="#F58518"/>
+  <text x="227.5" y="46" class="legend-text">prost</text>
+  <rect x="279.0" y="35" width="14" height="14" rx="2" fill="#54A24B"/>
+  <text x="297.0" y="46" class="legend-text">Go</text>
+  <line x1="140.0" y1="80" x2="140.0" y2="436" class="grid"/>
+  <text x="140.0" y="451" text-anchor="middle" class="axis-label">0</text>
+  <line x1="256.0" y1="80" x2="256.0" y2="436" class="grid"/>
+  <text x="256.0" y="451" text-anchor="middle" class="axis-label">400</text>
+  <line x1="372.0" y1="80" x2="372.0" y2="436" class="grid"/>
+  <text x="372.0" y="451" text-anchor="middle" class="axis-label">800</text>
+  <line x1="488.0" y1="80" x2="488.0" y2="436" class="grid"/>
+  <text x="488.0" y="451" text-anchor="middle" class="axis-label">1.2k</text>
+  <line x1="604.0" y1="80" x2="604.0" y2="436" class="grid"/>
+  <text x="604.0" y="451" text-anchor="middle" class="axis-label">1.6k</text>
+  <line x1="720.0" y1="80" x2="720.0" y2="436" class="grid"/>
+  <text x="720.0" y="451" text-anchor="middle" class="axis-label">2.0k</text>
+  <text x="430.0" y="466" text-anchor="middle" class="axis-label">MiB/s</text>
+  <text x="130" y="121.0" text-anchor="end" class="label">ApiResponse</text>
+  <rect x="140" y="80.0" width="251.9" height="22" rx="2" fill="#4C78A8"/>
+  <text x="395.9" y="95.0" class="value">868</text>
+  <rect x="140" y="106.0" width="225.1" height="22" rx="2" fill="#F58518"/>
+  <text x="369.1" y="121.0" class="value">776</text>
+  <rect x="140" y="132.0" width="34.6" height="22" rx="2" fill="#54A24B"/>
+  <text x="178.6" y="147.0" class="value">119</text>
+  <text x="130" y="215.0" text-anchor="end" class="label">LogRecord</text>
+  <rect x="140" y="174.0" width="387.2" height="22" rx="2" fill="#4C78A8"/>
+  <text x="531.2" y="189.0" class="value">1,335</text>
+  <rect x="140" y="200.0" width="318.7" height="22" rx="2" fill="#F58518"/>
+  <text x="462.7" y="215.0" class="value">1,098</text>
+  <rect x="140" y="226.0" width="41.6" height="22" rx="2" fill="#54A24B"/>
+  <text x="185.6" y="241.0" class="value">143</text>
+  <text x="130" y="309.0" text-anchor="end" class="label">AnalyticsEvent</text>
+  <rect x="140" y="268.0" width="226.5" height="22" rx="2" fill="#4C78A8"/>
+  <text x="370.5" y="283.0" class="value">781</text>
+  <rect x="140" y="294.0" width="222.6" height="22" rx="2" fill="#F58518"/>
+  <text x="366.6" y="309.0" class="value">767</text>
+  <rect x="140" y="320.0" width="15.2" height="22" rx="2" fill="#54A24B"/>
+  <text x="159.2" y="335.0" class="value">52</text>
+  <text x="130" y="403.0" text-anchor="end" class="label">GoogleMessage1</text>
+  <rect x="140" y="362.0" width="303.6" height="22" rx="2" fill="#4C78A8"/>
+  <text x="447.6" y="377.0" class="value">1,047</text>
+  <rect x="140" y="388.0" width="243.6" height="22" rx="2" fill="#F58518"/>
+  <text x="387.6" y="403.0" class="value">840</text>
+  <rect x="140" y="414.0" width="37.5" height="22" rx="2" fill="#54A24B"/>
+  <text x="181.5" y="429.0" class="value">129</text>
+</svg>

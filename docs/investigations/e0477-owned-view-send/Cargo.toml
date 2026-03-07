@@ -1,0 +1,30 @@
+# Not a workspace member — not built in CI. Historical artifact only.
+# Run manually with `cargo check --manifest-path <this file> --features <case>`.
+[workspace]
+
+[package]
+name = "e0477-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+trait-variant = "0.1"
+
+[features]
+# Each feature gates one test case. Expected outcomes in README.md.
+repro_a = []   # async fn vs `fn -> impl Future + Send`         → E0477 / OK with auto_send
+repro_b = []   # async fn vs trait_variant::make(Send)          → E0477 (identical expansion)
+repro_c = []   # trait_variant dual-trait local variant         → compiles but doesn't give Send
+drop_g1 = []   # drop(req) after using across await             → E0477
+drop_g2 = []   # `let req = req;` rebind                        → E0477
+drop_g3 = []   # drop(req) before any await                     → E0477
+drop_g4 = []   # baseline — no drop/rebind                      → E0477
+drop_g5 = []   # consume+shadow on line 1 (`to_owned_message`)  → E0477
+drop_g6 = []   # empty body, `_req` unused                      → E0477 (proves signature-level)
+drop_g7 = []   # `_` pattern, never bound                       → E0477
+cow_h = []     # Cow<'static, str> (auto-Send, no 'static bound) → OK
+auto_send = [] # switch Owned<V> to auto-trait Send             → all cases OK
+cross_old = [] # cross-boundary patterns with manual impl       → 5/6 E0477
+# RTN cases (d/e/f) removed — unstable syntax is parse-gated and can't be
+# cfg'd away. See README for what they showed.

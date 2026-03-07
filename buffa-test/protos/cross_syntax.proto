@@ -1,0 +1,22 @@
+// Proto2 file importing a proto3 enum.
+//
+// Spec (protobuf.dev/programming-guides/enum): proto2 importing proto3 enum
+// treats it as OPEN (declaring file's syntax governs). C++/Java/Kotlin are
+// out-of-conformance here (they treat it as closed); buffa follows the spec.
+//
+// The reverse (proto3 importing proto2 enum) is rejected by protoc itself.
+
+syntax = "proto2";
+
+package test.cross_syntax;
+
+import "basic.proto";
+
+message UsesProto3Enum {
+  // basic.Status is declared in a proto3 file → treated as open even
+  // though THIS file is proto2. Field type must be EnumValue<Status>,
+  // not bare Status, and unknown values must be preserved in the field
+  // (not routed to unknown_fields).
+  optional basic.Status status = 1;
+  repeated basic.Status statuses = 2;
+}

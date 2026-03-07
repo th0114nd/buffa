@@ -1,0 +1,45 @@
+// Structured log entries for application logging.
+// Demonstrates cross-package imports, enums, timestamps, and map fields.
+
+syntax = "proto3";
+
+package buffa.examples.log.v1;
+
+import "context/v1/context.proto";
+import "google/protobuf/timestamp.proto";
+
+// Severity level for a log entry.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  DEBUG = 1;
+  INFO = 2;
+  WARN = 3;
+  ERROR = 4;
+  FATAL = 5;
+}
+
+// A single structured log entry.
+message LogEntry {
+  // When the log entry was created.
+  google.protobuf.Timestamp timestamp = 1;
+
+  // Severity level.
+  Severity severity = 2;
+
+  // The log message.
+  string message = 3;
+
+  // The logger name (e.g. module path).
+  string logger = 4;
+
+  // Request context, if this log was produced during request handling.
+  buffa.examples.context.v1.RequestContext context = 5;
+
+  // Structured key-value fields for machine-readable data.
+  map<string, string> fields = 6;
+}
+
+// A batch of log entries, for length-delimited streaming I/O.
+message LogBatch {
+  repeated LogEntry entries = 1;
+}

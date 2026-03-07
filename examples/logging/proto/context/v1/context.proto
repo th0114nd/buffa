@@ -1,0 +1,24 @@
+// Request context attached to log entries and metric events.
+// Demonstrates a shared package referenced by other packages.
+
+syntax = "proto3";
+
+package buffa.examples.context.v1;
+
+// Contextual information about the request that produced a log entry.
+message RequestContext {
+  // A unique identifier for the request (e.g. trace ID).
+  string request_id = 1;
+
+  // The authenticated user, if any.
+  string user_id = 2;
+
+  // The HTTP method (GET, POST, etc.).
+  string method = 3;
+
+  // The request path.
+  string path = 4;
+
+  // Arbitrary key-value metadata.
+  map<string, string> metadata = 5;
+}

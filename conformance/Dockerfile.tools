@@ -1,0 +1,143 @@
+# Build the protobuf conformance_test_runner and extract the test .proto files.
+#
+# Uses Alpine/musl as the build base so that the resulting binary is fully
+# statically linked (no libc or libstdc++ runtime dependencies) and runs on
+# any Linux distribution.
+#
+# Build for all supported platforms and push to a registry:
+#
+#   docker buildx build \
+#       --platform linux/amd64,linux/arm64 \
+#       -t ghcr.io/anthropics/buffa/tools:v33.5 \
+#       --push \
+#       -f conformance/Dockerfile.tools .
+#
+# See `task tools-image` / `task tools-image-local` in the root Taskfile.
+
+FROM alpine:3.21 AS builder
+
+# Build dependencies.  alpine-sdk includes make; linux-headers lets abseil
+# detect the target architecture.  libstdc++-dev supplies libstdc++.a for
+# static linking.
+RUN apk add --no-cache \
+    cmake g++ git make python3 linux-headers \
+    libstdc++-dev file
+
+ARG PROTOBUF_TAG=v33.5
+ARG JSONCPP_TAG=1.9.6
+
+# Pre-install jsoncpp as a static library.  protobuf's conformance cmake
+# expects the `jsoncpp_lib` cmake target, which jsoncpp only creates when
+# BUILD_SHARED_LIBS=ON.  Building and installing it separately (as a static
+# library) produces the cmake config files that `find_package(jsoncpp)` needs
+# to create the expected target.
+RUN git clone --depth=1 --branch ${JSONCPP_TAG} \
+    https://github.com/open-source-parsers/jsoncpp.git /tmp/jsoncpp \
+    && cmake -B /tmp/jsoncpp/_build -S /tmp/jsoncpp \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DJSONCPP_WITH_TESTS=OFF \
+        -DJSONCPP_WITH_POST_BUILD_UNITTEST=OFF \
+    && cmake --build /tmp/jsoncpp/_build -j$(nproc) \
+    && cmake --install /tmp/jsoncpp/_build \
+    && rm -rf /tmp/jsoncpp
+
+# Clone just the tag we need (shallow clone keeps the layer small).
+RUN git clone --depth=1 --branch ${PROTOBUF_TAG} \
+    https://github.com/protocolbuffers/protobuf.git /src/protobuf
+
+WORKDIR /src/protobuf
+
+# Build the conformance runner.
+#
+# -static: links against musl libc.a, libstdc++.a, and libgcc.a, producing
+#   a self-contained ELF binary with no external library dependencies.
+#
+# From v30+, abseil-cpp is fetched automatically via CMake FetchContent.
+# jsoncpp is pre-installed above and found via find_package.
+#
+# cmake --build is intentionally run without -G Ninja to avoid Alpine package
+# name ambiguity (ninja / samurai); GNU make is always available.
+RUN cmake -B _build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXE_LINKER_FLAGS="-static" \
+    -DBUILD_SHARED_LIBS=OFF \
+    -Dprotobuf_BUILD_TESTS=OFF \
+    -Dprotobuf_BUILD_CONFORMANCE=ON
+
+RUN cmake --build _build --target conformance_test_runner -j$(nproc)
+
+# Locate the binary (cmake generator determines its exact output path) and
+# copy it to a fixed location for the verify step and final COPY instruction.
+RUN find _build -name "conformance_test_runner" -type f \
+    | head -1 \
+    | xargs -I{} cp {} /conformance_test_runner \
+    && test -f /conformance_test_runner \
+    || { echo "FAIL: conformance_test_runner not found in _build/"; \
+         find _build -name "conformance_test_runner"; exit 1; }
+
+# Verify the binary is truly statically linked before packaging it.
+# `file` reports "statically linked" for static ELFs; fail the build if not.
+RUN file /conformance_test_runner | \
+    grep -q "statically linked" && \
+    echo "OK: conformance_test_runner is statically linked" || \
+    { echo "FAIL: binary has unexpected dynamic dependencies:"; \
+      file /conformance_test_runner; \
+      exit 1; }
+
+# Also build protoc (needed by buffa-build to compile editions test protos).
+# protoc is built as part of the default targets when protobuf_BUILD_PROTOC_BINARIES=ON.
+RUN cmake --build _build --target protoc -j$(nproc)
+RUN find _build -name "protoc*" -type f -not -name "*.o" -not -name "*.a" \
+    -not -name "*.cmake" -not -name "*.cc" \
+    | head -1 \
+    | xargs -I{} cp {} /protoc \
+    && test -f /protoc \
+    || { echo "FAIL: protoc not found in _build/"; \
+         find _build -name "protoc*" -type f | head -10; exit 1; }
+
+# ── Final image: just the binaries and the .proto files ───────────────────
+# FROM scratch keeps the image tiny and works because the binaries are
+# fully statically linked — no libc or shell is needed at runtime.
+FROM scratch
+
+# The conformance runner binary.
+COPY --from=builder /conformance_test_runner /conformance_test_runner
+
+# protoc binary for compiling editions test protos.
+COPY --from=builder /protoc /protoc
+
+# conformance.proto — defines ConformanceRequest / ConformanceResponse.
+COPY --from=builder \
+    /src/protobuf/conformance/conformance.proto \
+    /protos/conformance.proto
+
+# TestAllTypesProto3 and TestAllTypesProto2 (binary format test messages).
+COPY --from=builder \
+    /src/protobuf/src/google/protobuf/test_messages_proto3.proto \
+    /src/protobuf/src/google/protobuf/test_messages_proto2.proto \
+    /protos/google/protobuf/
+
+# Editions test messages: proto2/proto3 behavior via editions, plus
+# the pure edition 2023 test (which uses delimited/group encoding).
+COPY --from=builder \
+    /src/protobuf/editions/golden/test_messages_proto2_editions.proto \
+    /src/protobuf/editions/golden/test_messages_proto3_editions.proto \
+    /protos/editions/golden/
+COPY --from=builder \
+    /src/protobuf/conformance/test_protos/test_messages_edition2023.proto \
+    /protos/conformance/test_protos/
+# Edition unstable test messages (for future-edition conformance testing).
+COPY --from=builder \
+    /src/protobuf/conformance/test_protos/test_messages_edition_unstable.proto \
+    /protos/conformance/test_protos/
+
+# Well-known types imported by the test messages.
+COPY --from=builder \
+    /src/protobuf/src/google/protobuf/any.proto \
+    /src/protobuf/src/google/protobuf/duration.proto \
+    /src/protobuf/src/google/protobuf/field_mask.proto \
+    /src/protobuf/src/google/protobuf/struct.proto \
+    /src/protobuf/src/google/protobuf/timestamp.proto \
+    /src/protobuf/src/google/protobuf/wrappers.proto \
+    /protos/google/protobuf/

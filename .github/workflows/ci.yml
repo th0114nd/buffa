@@ -1,0 +1,227 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # protoc v27+ is required for editions 2023 support (utf8_validation.proto).
+  # Ubuntu's apt protobuf-compiler is v21.12 — too old. Keep this in sync
+  # with the conformance tools image (see conformance/Dockerfile.tools).
+  PROTOC_VERSION: "33.5"
+
+jobs:
+
+  # ── Fast feedback: lint + test on stable ─────────────────────────────────
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install protoc
+        run: |
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local
+          protoc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  # ── Markdown lint ────────────────────────────────────────────────────────
+  # Same pinned markdownlint-cli version as `task lint-md`. Node is
+  # preinstalled on ubuntu-latest so no setup-node step is needed.
+  lint-markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx --yes markdownlint-cli@0.47.0 '**/*.md' --ignore target --ignore .claude
+
+  # ── MSRV check ───────────────────────────────────────────────────────────
+  msrv-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85'
+
+      - name: Install protoc
+        run: |
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local
+          protoc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check (MSRV 1.85)
+        run: cargo check --workspace
+
+  # ── no_std and 32-bit compilation checks ─────────────────────────────────
+  check-nostd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu, thumbv7em-none-eabihf
+
+      - name: Install protoc
+        run: |
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local
+          protoc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check buffa no_std (host)
+        run: cargo check -p buffa --no-default-features
+
+      - name: Check buffa no_std (bare-metal ARM)
+        run: cargo check -p buffa --no-default-features --target thumbv7em-none-eabihf
+
+      - name: Check buffa-types no_std
+        run: cargo check -p buffa-types --no-default-features
+
+      - name: Check workspace 32-bit
+        run: cargo check --workspace --target i686-unknown-linux-gnu
+
+  # ── Verify checked-in generated code is up to date ───────────────────────
+  check-generated-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: |
+          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local
+          protoc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Regenerate bootstrap descriptor types
+        # Proto sources are vendored in buffa-codegen/protos/ (pinned),
+        # so this is independent of the installed protoc's bundled includes.
+        run: scripts/gen-bootstrap-types.sh
+
+      - name: Generate descriptor set (WKTs)
+        run: |
+          # WKT protos are vendored in buffa-types/protos (NOT read from
+          # /usr/local/include) so the checked-in code is pinned to a
+          # specific proto source, not whatever protoc version ships.
+          protoc --descriptor_set_out=/tmp/wkt.pb --include_imports \
+              -I buffa-types/protos \
+              google/protobuf/any.proto \
+              google/protobuf/duration.proto \
+              google/protobuf/empty.proto \
+              google/protobuf/field_mask.proto \
+              google/protobuf/struct.proto \
+              google/protobuf/timestamp.proto \
+              google/protobuf/wrappers.proto
+
+      - name: Regenerate WKT types
+        run: cargo run -p buffa-codegen --bin gen_wkt_types -- /tmp/wkt.pb buffa-types/src/generated
+
+      - name: Check for differences
+        run: |
+          if ! git diff --exit-code buffa-codegen/src/generated/ buffa-types/src/generated/; then
+            echo "::error::Checked-in generated code is stale. Run 'task gen-wkt-types' and/or regenerate bootstrap types, then commit."
+            exit 1
+          fi
+
+  # ── Conformance test suite ───────────────────────────────────────────────
+  # Builds conformance binaries on the runner (cached via rust-cache) and
+  # extracts the conformance_test_runner + proto files from the tools image.
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: conformance
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build tools image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: conformance/Dockerfile.tools
+          load: true
+          tags: buffa/tools:local
+          cache-from: type=gha,scope=tools-image
+          cache-to: type=gha,scope=tools-image,mode=max
+
+      - name: Extract tools from image
+        run: |
+          CID=$(docker create buffa/tools:local /dev/null)
+          docker cp "$CID:/conformance_test_runner" /usr/local/bin/conformance_test_runner
+          docker cp "$CID:/protoc" /usr/local/bin/protoc
+          docker cp "$CID:/protos/." conformance/protos/
+          docker rm "$CID"
+          chmod +x /usr/local/bin/conformance_test_runner /usr/local/bin/protoc
+
+      # Both builds use the same target dir so build-script artifacts
+      # (buffa-codegen, buffa-build, syn, etc.) are compiled only once.
+      # The std binary is copied out before the no_std build overwrites it.
+      - name: Determine host target
+        id: host
+        run: echo "triple=$(rustc -vV | grep '^host:' | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Build conformance binary (std)
+        run: >-
+          cargo build --release --manifest-path conformance/Cargo.toml
+          --target ${{ steps.host.outputs.triple }}
+
+      - name: Save std binary
+        run: cp conformance/target/${{ steps.host.outputs.triple }}/release/conformance /tmp/buffa-conformance-std
+
+      - name: Build conformance binary (no_std)
+        run: >-
+          cargo build --release --manifest-path conformance/Cargo.toml
+          --no-default-features --target ${{ steps.host.outputs.triple }}
+
+      - name: Run conformance tests (std)
+        run: >-
+          conformance_test_runner
+          --failure_list conformance/known_failures.txt
+          --maximum_edition 2024
+          /tmp/buffa-conformance-std
+
+      - name: Run conformance tests (no_std)
+        run: >-
+          conformance_test_runner
+          --failure_list conformance/known_failures_nostd.txt
+          --maximum_edition 2024
+          conformance/target/${{ steps.host.outputs.triple }}/release/conformance
+
+      - name: Run conformance tests (via-view)
+        env:
+          BUFFA_VIA_VIEW: "1"
+        run: >-
+          conformance_test_runner
+          --failure_list conformance/known_failures_view.txt
+          --maximum_edition 2024
+          /tmp/buffa-conformance-std

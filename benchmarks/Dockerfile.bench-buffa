@@ -1,0 +1,32 @@
+# Build and run buffa protobuf benchmarks.
+#
+# Usage:
+#   docker build -t buffa-bench-buffa -f benchmarks/Dockerfile.bench-buffa .
+#   docker run --rm buffa-bench-buffa
+
+FROM rust:1.85-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Copy the buffa workspace source (needed as path dependency).
+COPY Cargo.toml Cargo.lock ./
+COPY buffa/             buffa/
+COPY buffa-build/       buffa-build/
+COPY buffa-codegen/     buffa-codegen/
+COPY buffa-test/        buffa-test/
+COPY buffa-types/       buffa-types/
+COPY protoc-gen-buffa/  protoc-gen-buffa/
+
+# Copy benchmark shared files and the buffa benchmark crate.
+COPY benchmarks/proto/      benchmarks/proto/
+COPY benchmarks/datasets/   benchmarks/datasets/
+COPY benchmarks/buffa/      benchmarks/buffa/
+
+RUN cargo install cargo-criterion \
+    && cargo bench --manifest-path benchmarks/buffa/Cargo.toml --no-run
+
+ENTRYPOINT ["cargo", "criterion", "--manifest-path", "benchmarks/buffa/Cargo.toml", "--bench", "protobuf", "--message-format=json", "--", "--warm-up-time", "3", "--measurement-time", "5"]

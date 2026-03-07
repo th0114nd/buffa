@@ -1,0 +1,5 @@
+*.pb binary
+
+# Collapse diffs of checked-in generated code in GitHub PRs.
+buffa-codegen/src/generated/** linguist-generated=true
+buffa-types/src/generated/** linguist-generated=true

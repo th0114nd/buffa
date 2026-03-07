@@ -1,0 +1,44 @@
+// Tests well-known type integration: Timestamp, Duration, Any,
+// Struct/Value, wrappers, and FieldMask.
+
+syntax = "proto3";
+
+package test.wkt;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/field_mask.proto";
+
+// Message using various well-known types.
+message Event {
+  google.protobuf.Timestamp created_at = 1;
+  google.protobuf.Duration ttl = 2;
+  google.protobuf.Any payload = 3;
+  google.protobuf.Struct metadata = 4;
+  google.protobuf.Value extra = 5;
+
+  // Wrapper types for nullable scalars.
+  google.protobuf.Int32Value priority = 6;
+  google.protobuf.StringValue description = 7;
+  google.protobuf.BoolValue archived = 8;
+
+  google.protobuf.FieldMask update_mask = 9;
+
+  // Repeated WKTs.
+  repeated google.protobuf.Timestamp milestones = 10;
+}
+
+// WKT-typed oneof variants. Regression test: From<T> for Option<Oneof> must
+// NOT be generated for extern-crate T (orphan rule E0117 — Option is not
+// fundamental). From<T> for Oneof is fine (Oneof is local).
+message Envelope {
+  oneof content {
+    google.protobuf.Any any_content = 1;
+    google.protobuf.Timestamp ts_content = 2;
+    string text_content = 3;  // scalar — no From at all
+    Event event_content = 4;  // local message — both From impls
+  }
+}

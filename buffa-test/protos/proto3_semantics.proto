@@ -1,0 +1,124 @@
+// Comprehensive proto3-specific semantics tests.
+//
+// Proto3 is the most common syntax in new definitions. This file systematically
+// exercises proto3-specific behaviours that differ from proto2:
+//
+//   1. Implicit field presence: zero values are NOT encoded (wire efficiency).
+//   2. `optional` keyword (explicit presence): zero values ARE encoded.
+//   3. Open enums: unknown values preserved as EnumValue::Unknown.
+//   4. Packed repeated scalars by default.
+//   5. No custom defaults, no required, no groups (all rejected by protoc).
+
+syntax = "proto3";
+
+package test.proto3sem;
+
+// ── Implicit presence (singular scalars) ──────────────────────────────────
+// The core proto3 guarantee: a singular scalar at its zero value is NOT
+// encoded. On decode, absence-of-field means "use zero value". This is the
+// primary difference from proto2 where every optional field is Option<T>.
+
+message ImplicitScalars {
+  // One field per scalar type — all implicit-presence (no `optional`).
+  int32    i32  = 1;
+  int64    i64  = 2;
+  uint32   u32  = 3;
+  uint64   u64  = 4;
+  sint32   si32 = 5;
+  sint64   si64 = 6;
+  fixed32  fx32 = 7;
+  fixed64  fx64 = 8;
+  sfixed32 sfx32 = 9;
+  sfixed64 sfx64 = 10;
+  float    f32  = 11;
+  double   f64  = 12;
+  bool     b    = 13;
+  string   s    = 14;
+  bytes    by   = 15;
+}
+
+// ── Explicit presence (`optional` keyword) ────────────────────────────────
+// proto3 `optional` restores proto2-style explicit presence: Some(0) is
+// semantically distinct from None and MUST be encoded.
+//
+// Internally, each `optional` field creates a synthetic single-variant oneof
+// (FieldDescriptorProto.proto3_optional=true + oneof_index set). Codegen
+// must treat these as Option<T>, NOT as real oneofs.
+
+message OptionalAllTypes {
+  optional int32    i32  = 1;
+  optional int64    i64  = 2;
+  optional uint32   u32  = 3;
+  optional uint64   u64  = 4;
+  optional sint32   si32 = 5;
+  optional sint64   si64 = 6;
+  optional fixed32  fx32 = 7;
+  optional fixed64  fx64 = 8;
+  optional sfixed32 sfx32 = 9;
+  optional sfixed64 sfx64 = 10;
+  optional float    f32  = 11;
+  optional double   f64  = 12;
+  optional bool     b    = 13;
+  optional string   s    = 14;
+  optional bytes    by   = 15;
+  optional Color    e    = 16;
+
+  // optional message: redundant in proto3 (bare message fields already have
+  // explicit presence via MessageField), but protoc accepts it. Verify that
+  // the synthetic oneof is handled the same as bare.
+  optional ImplicitScalars nested = 17;
+}
+
+// ── Open enums ─────────────────────────────────────────────────────────────
+// Proto3 enums are open: unknown wire values are preserved, not dropped.
+// The Rust representation is EnumValue<E> which has Known(E) and Unknown(i32).
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  GREEN = 2;
+  BLUE = 3;
+}
+
+message EnumContexts {
+  // Singular implicit — EnumValue<Color>.
+  Color singular = 1;
+  // Repeated — packed by default.
+  repeated Color rep = 2;
+  // In a map value.
+  map<string, Color> by_key = 3;
+  // In a oneof.
+  oneof choice {
+    Color picked = 4;
+    int32 other = 5;
+  }
+}
+
+// ── Packed repeated scalars (default) ─────────────────────────────────────
+// Proto3 packs all repeated packable scalars by default. The encoder emits
+// a single LengthDelimited blob, not per-element tags.
+
+message RepeatedPacking {
+  // These are all packed by default in proto3.
+  repeated int32   ints    = 1;
+  repeated fixed32 fixeds  = 2;
+  repeated bool    bools   = 3;
+  repeated double  doubles = 4;
+  repeated Color   colors  = 5;
+
+  // Strings/bytes/messages are NEVER packed (length-delimited by nature).
+  repeated string strings = 6;
+}
+
+// ── Mixed presence in one message ─────────────────────────────────────────
+// Real-world schemas mix implicit and optional. Verify that codegen handles
+// both in the same message without interference.
+
+message MixedPresence {
+  int32            implicit_id   = 1;
+  optional int32   optional_id   = 2;
+  string           implicit_name = 3;
+  optional string  optional_name = 4;
+  Color            implicit_color = 5;
+  optional Color   optional_color = 6;
+}

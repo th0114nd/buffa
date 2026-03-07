@@ -1,0 +1,31 @@
+[package]
+name = "buffa"
+description = "A pure Rust Protocol Buffers implementation with first-class editions support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["std"]
+std = ["bytes/std", "thiserror/std", "serde?/std", "serde_json?/std"]
+json = ["dep:serde", "dep:base64", "dep:serde_json", "serde/alloc", "serde/derive", "hashbrown/serde"]
+arbitrary = ["dep:arbitrary"]
+
+[dependencies]
+arbitrary = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+bytes = { workspace = true }
+hashbrown = { workspace = true }
+once_cell = { workspace = true, features = ["alloc"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }

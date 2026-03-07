@@ -1,0 +1,173 @@
+// Tests proto2 features: required fields, custom default values,
+// closed enums, and groups (as unknown fields).
+
+syntax = "proto2";
+
+package test.proto2;
+
+enum Priority {
+  LOW = 0;
+  MEDIUM = 1;
+  HIGH = 2;
+  CRITICAL = 3;
+}
+
+message WithDefaults {
+  // Scalars with custom defaults.
+  optional int32 count = 1 [default = 42];
+  optional string label = 2 [default = "untitled"];
+  optional bool enabled = 3 [default = true];
+  optional float ratio = 4 [default = 0.5];
+  optional double precise = 5 [default = 3.14159];
+  optional uint32 flags = 6 [default = 255];
+  optional int64 big = 7 [default = -1000000];
+  optional bytes magic = 8 [default = "\x00\xFF\x42"];
+
+  // Enum with custom default.
+  optional Priority priority = 9 [default = MEDIUM];
+
+  // Special float defaults.
+  optional float pos_inf = 10 [default = inf];
+  optional float neg_inf = 11 [default = -inf];
+  optional float nan_val = 12 [default = nan];
+
+  // Required field (always encoded, no default suppression).
+  required string name = 13;
+  required int32 id = 14;
+}
+
+// Required fields with custom defaults — the only context where the custom
+// default value is emitted into `impl Default` (optional fields stay None;
+// buffa doesn't generate proto2-style getter methods).
+message RequiredDefaults {
+  required int32 count = 1 [default = 42];
+  required string label = 2 [default = "line1\nline2\t\"quoted\""];
+  required bytes magic = 3 [default = "\x00\xFF"];
+
+  // One required field per scalar type to cover every parse_default_value
+  // branch. These exercise buffa-codegen/src/defaults.rs paths that
+  // previously had no test proto shape (bool, uint32/64, int64, floats,
+  // float special values on both f32 and f64, enum).
+  required bool on = 4 [default = true];
+  required uint32 u = 5 [default = 4294967295];
+  required int64 i64v = 6 [default = -9223372036854775808];
+  required uint64 u64v = 7 [default = 18446744073709551615];
+  required float f = 8 [default = 1.5];
+  required double d_inf = 9 [default = inf];
+  required double d_ninf = 10 [default = -inf];
+  required double d_nan = 11 [default = nan];
+  required Priority level = 12 [default = CRITICAL];
+  required sint32 s32 = 13 [default = -1];
+  required sint64 s64 = 14 [default = -1];
+  required fixed32 fx32 = 15 [default = 100];
+  required fixed64 fx64 = 16 [default = 200];
+  required sfixed32 sfx32 = 17 [default = -100];
+  required sfixed64 sfx64 = 18 [default = -200];
+}
+
+// Regression: enum value name that is a Rust keyword. enumeration.rs uses
+// make_field_ident (escapes keywords → r#type or Self_); defaults.rs must
+// use the same escaping or the generated Default impl won't compile.
+enum KeywordValues {
+  NORMAL = 0;
+  // 'type' (lowercase) is a Rust keyword — unusual but valid proto.
+  type = 1;
+  // 'Self' is a Rust path-position keyword (can't be r#, gets _ suffix).
+  Self = 2;
+}
+
+message KeywordEnumDefault {
+  required KeywordValues kind = 1 [default = type];
+  required KeywordValues who = 2 [default = Self];
+}
+
+// Simple message for sub-message field testing.
+message Tag {
+  optional string key = 1;
+  optional string value = 2;
+}
+
+// Message with various proto2 field types.
+message Proto2Message {
+  optional string text = 1;
+  optional int32 number = 2;
+  repeated string items = 3;
+  optional Tag tag = 4;
+  optional Priority priority = 5;
+}
+
+// Message with group fields to test proto2 group encoding/decoding.
+message WithGroups {
+  // Singular group field.
+  optional group MyGroup = 1 {
+    optional int32 a = 2;
+    optional string b = 3;
+  }
+
+  // Repeated group field.
+  repeated group Item = 4 {
+    optional int32 id = 5;
+    optional string name = 6;
+  }
+
+  // Regular field alongside groups to ensure they coexist.
+  optional string label = 7;
+}
+
+// Negative enum values (proto2-only). Encode as 10-byte varints
+// (sign-extended to 64 bits) even though the value fits in 32 bits.
+enum Signed {
+  ZERO = 0;
+  POS_ONE = 1;
+  NEG_ONE = -1;
+  NEG_BIG = -128;
+}
+
+message WithSignedEnum {
+  optional Signed value = 1 [default = NEG_ONE];
+  repeated Signed values = 2;
+}
+
+// Explicit [packed = true] in proto2 (proto2 default is unpacked).
+// Mirror of PackedOverride in edge_cases.proto.
+message Proto2PackedOverride {
+  repeated int32 default_unpacked = 1;
+  repeated int32 explicit_packed = 2 [packed = true];
+}
+
+// Closed-enum unknown-value routing to unknown_fields (proto spec).
+// Proto2 enums are always closed; unknown values must go to the unknown
+// field set for round-trip fidelity, not be silently dropped.
+message ClosedEnumContexts {
+  optional Priority opt = 1;
+  repeated Priority rep = 2;
+  repeated Priority rep_packed = 3 [packed = true];
+  oneof choice {
+    Priority one = 4;
+    int32 other = 5;
+  }
+}
+
+// View codegen coverage: shapes that previously weren't exercised through
+// the view generator with a proto2 (closed-enum, group-capable) schema.
+message ViewCoverage {
+  // Required enum → bare `E` view field (not Option<E>). Covers singular
+  // closed-enum view type and decode-arm (view.rs:349, 688-692).
+  required Priority level = 1;
+
+  // Non-string map key → scalar_ty() path in view map codegen.
+  map<int32, string> by_id = 2;
+
+  // Closed-enum map value → enum branch in view map value type + decode.
+  map<string, Priority> priorities = 3;
+
+  // Group inside a oneof — proto2 allows this but it's rare. Covers the
+  // TYPE_GROUP branch in oneof view decode (view.rs:1044-1062).
+  oneof choice {
+    group Payload = 4 {
+      optional int32 x = 5;
+      optional string y = 6;
+    }
+    int32 code = 7;
+  }
+}

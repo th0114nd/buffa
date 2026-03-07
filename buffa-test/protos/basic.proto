@@ -1,0 +1,97 @@
+// Basic proto3 test message covering all field types: scalars, string, bytes,
+// enum, nested message, repeated, proto3-optional, oneof, and map.
+
+syntax = "proto3";
+
+package basic;
+
+enum Status {
+  UNKNOWN = 0;
+  ACTIVE = 1;
+  INACTIVE = 2;
+}
+
+message Address {
+  string street = 1;
+  string city = 2;
+  uint32 zip_code = 3;
+}
+
+message Person {
+  // Scalar fields (proto3 implicit presence)
+  int32 id = 1;
+  string name = 2;
+  bytes avatar = 3;
+  bool verified = 4;
+  double score = 5;
+
+  // Enum field
+  Status status = 6;
+
+  // Nested message field
+  Address address = 7;
+
+  // Repeated fields
+  repeated string tags = 8;
+  repeated int32 lucky_numbers = 9;
+  repeated Address addresses = 10;
+
+  // Proto3 optional (explicit presence)
+  optional int32 maybe_age = 11;
+  optional string maybe_nickname = 12;
+
+  // Oneof field
+  oneof contact {
+    string email = 13;
+    string phone = 14;
+  }
+}
+
+// Message with map fields. Views enabled — MapView codegen covers:
+// string-keyed scalar value, string-keyed message value, open-enum value.
+message Inventory {
+  map<string, int32> stock = 1;
+  map<string, Address> locations = 2;
+  // Open enum (proto3) as map value — exercises EnumValue<E> branch in
+  // view map value type/decode codegen.
+  map<string, Status> statuses = 3;
+}
+
+// Minimal message to test default instances and empty encoding.
+message Empty {}
+
+// Bytes fields in every container context — compiled twice via build.rs:
+// once with Vec<u8> (normal), once with bytes::Bytes + views (bytes_variant).
+// Covers bytes_to_owned() for repeated + oneof (view.rs:1314, :1365) where
+// the expr is `*b` / `*v`. See tests/bytes_type.rs.
+message BytesContexts {
+  bytes singular = 1;
+  optional bytes maybe = 2;
+  repeated bytes many = 3;
+  oneof choice {
+    bytes raw = 4;
+    string text = 5;
+  }
+  // bytes_fields config does NOT apply to map values (map_rust_type_from_entry
+  // goes through scalar_rust_type which unconditionally uses Vec<u8>). This
+  // field pins that behaviour: if someone implements bytes_fields-for-maps on
+  // only one of {owned, view-to_owned}, the type mismatch compiles-out here.
+  map<string, bytes> by_key = 6;
+}
+
+// Message to test all numeric scalar types.
+message AllScalars {
+  int32 f_int32 = 1;
+  int64 f_int64 = 2;
+  uint32 f_uint32 = 3;
+  uint64 f_uint64 = 4;
+  sint32 f_sint32 = 5;
+  sint64 f_sint64 = 6;
+  fixed32 f_fixed32 = 7;
+  fixed64 f_fixed64 = 8;
+  sfixed32 f_sfixed32 = 9;
+  sfixed64 f_sfixed64 = 10;
+  float f_float = 11;
+  double f_double = 12;
+  bool f_bool = 13;
+}

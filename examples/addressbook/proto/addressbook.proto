@@ -1,0 +1,53 @@
+// An address book example demonstrating common protobuf patterns:
+// nested messages, enums, oneofs, repeated fields, and well-known types.
+
+syntax = "proto3";
+
+package buffa.examples.addressbook.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// A person in the address book.
+message Person {
+  string name = 1;
+  int32 id = 2;
+  string email = 3;
+
+  // A phone number with a type classification.
+  message PhoneNumber {
+    string number = 1;
+    PhoneType type = 2;
+  }
+
+  enum PhoneType {
+    PHONE_TYPE_UNSPECIFIED = 0;
+    PHONE_TYPE_MOBILE = 1;
+    PHONE_TYPE_HOME = 2;
+    PHONE_TYPE_WORK = 3;
+  }
+
+  repeated PhoneNumber phones = 4;
+
+  // When the contact was last updated.
+  google.protobuf.Timestamp last_updated = 5;
+
+  // Optional address — demonstrates oneof for structured vs. freeform.
+  oneof address {
+    StructuredAddress structured_address = 6;
+    string freeform_address = 7;
+  }
+}
+
+// A structured postal address.
+message StructuredAddress {
+  string street = 1;
+  string city = 2;
+  string state = 3;
+  string zip_code = 4;
+  string country = 5;
+}
+
+// A collection of contacts.
+message AddressBook {
+  repeated Person people = 1;
+}

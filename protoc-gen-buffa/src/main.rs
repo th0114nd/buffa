@@ -1,0 +1,304 @@
+//! protoc plugin for generating Rust code with buffa.
+//!
+//! This binary follows the protoc plugin protocol:
+//! 1. Read a serialized `CodeGeneratorRequest` from stdin.
+//! 2. Pass the file descriptors to `buffa-codegen`.
+//! 3. Write a serialized `CodeGeneratorResponse` to stdout.
+//!
+//! Usage:
+//!   protoc --buffa_out=. --plugin=protoc-gen-buffa my_service.proto
+//!
+//! Or with buf:
+//!   # buf.gen.yaml
+//!   plugins:
+//!     - local: protoc-gen-buffa
+//!       out: src/gen
+
+use std::io::{self, Read, Write};
+
+use buffa::Message;
+use buffa_codegen::generated::compiler::code_generator_response::File as CodeGeneratorResponseFile;
+use buffa_codegen::generated::compiler::{CodeGeneratorRequest, CodeGeneratorResponse};
+use buffa_codegen::generated::descriptor::Edition;
+
+use buffa_codegen::CodeGenConfig;
+
+fn main() {
+    match run() {
+        Ok(()) => {}
+        Err(e) => {
+            // Protocol: write a response with an error string, don't just crash.
+            let response = CodeGeneratorResponse {
+                error: Some(format!("{}", e)),
+                supported_features: Some(feature_flags()),
+                ..Default::default()
+            };
+            write_response(&response).unwrap_or_else(|io_err| {
+                eprintln!(
+                    "protoc-gen-buffa: failed to write error response: {}",
+                    io_err
+                );
+                std::process::exit(1);
+            });
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Read the entire request from stdin.
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+
+    // Decode the CodeGeneratorRequest.
+    let request = CodeGeneratorRequest::decode_from_slice(&input)
+        .map_err(|e| format!("failed to decode CodeGeneratorRequest: {}", e))?;
+
+    // Parse plugin parameters (e.g., "views=true,unknown_fields=false").
+    let config = parse_config(request.parameter.as_deref().unwrap_or(""));
+
+    // Run code generation.
+    let generated = buffa_codegen::generate(
+        &request.proto_file,
+        &request.file_to_generate,
+        &config.codegen,
+    )?;
+
+    // Build the response.
+    let mut files: Vec<CodeGeneratorResponseFile> = generated
+        .iter()
+        .map(|g| CodeGeneratorResponseFile {
+            name: Some(g.name.clone()),
+            content: Some(g.content.clone()),
+            ..Default::default()
+        })
+        .collect();
+
+    // If mod_file is requested, generate a module tree include file.
+    // Build (file_name, package) pairs from the file descriptors.
+    if let Some(ref mod_file_name) = config.mod_file {
+        let entries: Vec<(&str, &str)> = generated
+            .iter()
+            .map(|g| {
+                // Find the file descriptor whose proto path matches this generated file.
+                let package = request
+                    .proto_file
+                    .iter()
+                    .find(|fd| {
+                        fd.name
+                            .as_deref()
+                            .is_some_and(|n| buffa_codegen::proto_path_to_rust_module(n) == g.name)
+                    })
+                    .and_then(|fd| fd.package.as_deref())
+                    .unwrap_or("");
+                (g.name.as_str(), package)
+            })
+            .collect();
+        let content = buffa_codegen::generate_module_tree(&entries, "", true);
+        files.push(CodeGeneratorResponseFile {
+            name: Some(mod_file_name.clone()),
+            content: Some(content),
+            ..Default::default()
+        });
+    }
+
+    let response = CodeGeneratorResponse {
+        supported_features: Some(feature_flags()),
+        // Tell protoc which editions we support.
+        minimum_edition: Some(Edition::EDITION_PROTO2 as i32),
+        maximum_edition: Some(Edition::EDITION_2024 as i32),
+        file: files,
+        ..Default::default()
+    };
+
+    write_response(&response)?;
+    Ok(())
+}
+
+/// Write the serialized CodeGeneratorResponse to stdout.
+fn write_response(response: &CodeGeneratorResponse) -> io::Result<()> {
+    let mut output = Vec::new();
+    response.encode(&mut output);
+    io::stdout().write_all(&output)?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+/// Feature flags we support (bitmask).
+fn feature_flags() -> u64 {
+    const FEATURE_PROTO3_OPTIONAL: u64 = 1;
+    const FEATURE_SUPPORTS_EDITIONS: u64 = 2;
+    FEATURE_PROTO3_OPTIONAL | FEATURE_SUPPORTS_EDITIONS
+}
+
+/// Plugin configuration parsed from the parameter string.
+struct PluginConfig {
+    /// Code generation options passed to buffa-codegen.
+    codegen: CodeGenConfig,
+    /// If set, emit a module tree file with this name alongside the
+    /// per-file outputs. Requires `strategy: all` in buf.gen.yaml.
+    mod_file: Option<String>,
+}
+
+/// Parse the plugin parameter string into a PluginConfig.
+///
+/// Parameters are comma-separated key=value pairs:
+///   --buffa_opt=views=true,unknown_fields=false,json=true
+///
+/// Extern paths use the format `extern_path=<proto>=<rust>`:
+///   --buffa_opt=extern_path=.my.common=::common_protos
+///
+/// Module tree generation:
+///   --buffa_opt=mod_file=_mod.rs
+fn parse_config(params: &str) -> PluginConfig {
+    let mut codegen = CodeGenConfig::default();
+    let mut mod_file = None;
+
+    if params.is_empty() {
+        return PluginConfig { codegen, mod_file };
+    }
+
+    for param in params.split(',') {
+        let param = param.trim();
+        if let Some((key, value)) = param.split_once('=') {
+            match key.trim() {
+                "views" => codegen.generate_views = value.trim() == "true",
+                "unknown_fields" => codegen.preserve_unknown_fields = value.trim() != "false",
+                "json" => codegen.generate_json = value.trim() == "true",
+                "arbitrary" => codegen.generate_arbitrary = value.trim() == "true",
+                "strict_utf8" | "strict_utf8_mapping" => {
+                    codegen.strict_utf8_mapping = value.trim() == "true"
+                }
+                "mod_file" => mod_file = Some(value.trim().to_string()),
+                "extern_path" => {
+                    // value is "<proto_path>=<rust_path>"
+                    if let Some((proto, rust)) = value.split_once('=') {
+                        let mut proto = proto.trim().to_string();
+                        // Normalize: accept both ".my.pkg" and "my.pkg".
+                        if !proto.starts_with('.') {
+                            proto.insert(0, '.');
+                        }
+                        codegen.extern_paths.push((proto, rust.trim().to_string()));
+                    } else {
+                        eprintln!(
+                            "protoc-gen-buffa: invalid extern_path format '{}', \
+                             expected 'extern_path=.proto.pkg=::rust::path'",
+                            value
+                        );
+                    }
+                }
+                other => {
+                    eprintln!("protoc-gen-buffa: unknown parameter '{}'", other);
+                }
+            }
+        }
+    }
+
+    PluginConfig { codegen, mod_file }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_params_returns_defaults() {
+        let config = parse_config("");
+        let defaults = CodeGenConfig::default();
+        assert_eq!(config.codegen.generate_views, defaults.generate_views);
+        assert_eq!(
+            config.codegen.preserve_unknown_fields,
+            defaults.preserve_unknown_fields
+        );
+        assert_eq!(config.codegen.generate_json, defaults.generate_json);
+        assert!(config.codegen.extern_paths.is_empty());
+        assert!(config.mod_file.is_none());
+    }
+
+    #[test]
+    fn views_true() {
+        let config = parse_config("views=true");
+        assert!(config.codegen.generate_views);
+    }
+
+    #[test]
+    fn views_false() {
+        let config = parse_config("views=false");
+        assert!(!config.codegen.generate_views);
+    }
+
+    #[test]
+    fn json_true() {
+        let config = parse_config("json=true");
+        assert!(config.codegen.generate_json);
+    }
+
+    #[test]
+    fn unknown_fields_false() {
+        let config = parse_config("unknown_fields=false");
+        assert!(!config.codegen.preserve_unknown_fields);
+    }
+
+    #[test]
+    fn unknown_fields_true() {
+        let config = parse_config("unknown_fields=true");
+        assert!(config.codegen.preserve_unknown_fields);
+    }
+
+    #[test]
+    fn mod_file() {
+        let config = parse_config("mod_file=_mod.rs");
+        assert_eq!(config.mod_file, Some("_mod.rs".to_string()));
+    }
+
+    #[test]
+    fn extern_path_with_leading_dot() {
+        let config = parse_config("extern_path=.my.common=::common_protos");
+        assert_eq!(config.codegen.extern_paths.len(), 1);
+        assert_eq!(config.codegen.extern_paths[0].0, ".my.common");
+        assert_eq!(config.codegen.extern_paths[0].1, "::common_protos");
+    }
+
+    #[test]
+    fn extern_path_without_leading_dot_is_normalized() {
+        let config = parse_config("extern_path=my.common=::common_protos");
+        assert_eq!(config.codegen.extern_paths[0].0, ".my.common");
+    }
+
+    #[test]
+    fn multiple_params() {
+        let config = parse_config("views=true,json=true,mod_file=mod.rs");
+        assert!(config.codegen.generate_views);
+        assert!(config.codegen.generate_json);
+        assert_eq!(config.mod_file, Some("mod.rs".to_string()));
+    }
+
+    #[test]
+    fn multiple_extern_paths() {
+        let config = parse_config("extern_path=.my.a=::crate_a,extern_path=.my.b=::crate_b");
+        assert_eq!(config.codegen.extern_paths.len(), 2);
+        assert_eq!(config.codegen.extern_paths[0].0, ".my.a");
+        assert_eq!(config.codegen.extern_paths[1].0, ".my.b");
+    }
+
+    #[test]
+    fn whitespace_is_trimmed() {
+        let config = parse_config(" views = true , json = true ");
+        assert!(config.codegen.generate_views);
+        assert!(config.codegen.generate_json);
+    }
+
+    #[test]
+    fn unknown_param_is_ignored() {
+        // Should not panic; unknown params produce an eprintln warning.
+        let config = parse_config("unknown_key=value");
+        let defaults = CodeGenConfig::default();
+        assert_eq!(config.codegen.generate_views, defaults.generate_views);
+    }
+
+    #[test]
+    fn invalid_extern_path_is_ignored() {
+        // Missing "=" in the value — should not panic.
+        let config = parse_config("extern_path=no_equals_sign");
+        assert!(config.codegen.extern_paths.is_empty());
+    }
+}

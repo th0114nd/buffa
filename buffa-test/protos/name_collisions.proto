@@ -1,0 +1,71 @@
+// Tests for potential name collisions between proto names and Rust
+// built-in types, generated method names, and oneof/message names.
+
+syntax = "proto3";
+
+package test.collisions;
+
+// Messages named after Rust prelude/std types.
+// Generated code uses absolute paths (::core::option::Option etc.)
+// so these should not shadow Rust built-ins.
+
+message Vec {
+  repeated int32 items = 1;
+}
+
+message String {
+  string value = 1;
+}
+
+message Option {
+  bool present = 1;
+}
+
+message Result {
+  bool ok = 1;
+  string error = 2;
+}
+
+message Box {
+  bytes content = 1;
+}
+
+message Default {
+  int32 value = 1;
+}
+
+// Message with fields named after Message trait methods.
+// These are struct fields, not methods, so they should not collide
+// with the impl Message methods.
+message MethodNames {
+  int32 compute_size = 1;
+  string write_to = 2;
+  bytes encode = 3;
+  bool decode = 4;
+  string merge = 5;
+  int32 clear = 6;
+  int32 cached_size = 7;
+}
+
+// Message with a oneof whose PascalCase name matches the parent message.
+// message Foo with oneof foo → struct Foo + enum Foo in same module.
+// The enum should go in the message's module (pub mod foo { enum Foo })
+// so the names don't actually collide at the same level.
+message Status {
+  oneof status {
+    int32 code = 1;
+    string message = 2;
+  }
+}
+
+// Message that references the collision-prone types above.
+message Container {
+  Vec vec_field = 1;
+  String string_field = 2;
+  Option option_field = 3;
+  Result result_field = 4;
+  Box box_field = 5;
+  Default default_field = 6;
+  MethodNames methods = 7;
+  Status status = 8;
+}

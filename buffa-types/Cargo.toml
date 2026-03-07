@@ -1,0 +1,31 @@
+[package]
+name = "buffa-types"
+description = "Protobuf well-known types for buffa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["std"]
+std = ["buffa/std", "thiserror/std", "serde?/std", "serde_json?/std"]
+json = ["dep:serde", "dep:serde_json", "buffa/json"]
+arbitrary = ["dep:arbitrary", "buffa/arbitrary"]
+
+[dependencies]
+arbitrary = { workspace = true, optional = true }
+buffa = { workspace = true, default-features = false }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+# No [build-dependencies]. WKT code is checked in at src/generated/ so
+# consumers don't need protoc or the buffa-build/buffa-codegen toolchain.
+# Regenerate with `task gen-wkt-types` if codegen output format changes.

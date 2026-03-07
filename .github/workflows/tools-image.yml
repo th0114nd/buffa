@@ -1,0 +1,163 @@
+name: Build Tools Image
+
+# Triggers:
+#   1. Manual dispatch — choose a specific protobuf version to build.
+#   2. Push to main that modifies Dockerfile.tools — keeps the cached image
+#      current when the build recipe itself is updated.
+#
+# In both cases the resulting image is pushed to GHCR and tagged with the
+# protobuf version (e.g. ghcr.io/<owner>/buffa/tools:v33.5).
+
+on:
+  workflow_dispatch:
+    inputs:
+      protobuf_version:
+        description: 'Protobuf release tag (e.g. v29.5)'
+        required: true
+        default: 'v33.5'
+
+  push:
+    branches: [main]
+    paths: ['conformance/Dockerfile.tools']
+
+permissions:
+  contents: read
+  packages: write      # push to GHCR
+  id-token: write      # Sigstore OIDC (cosign keyless + GitHub attestations)
+  attestations: write  # GitHub native attestation API
+
+env:
+  REGISTRY: ghcr.io
+  # Path-style image name auto-links to the repo in GitHub's package UI.
+  # Forks get their own copy via github.repository (owner/repo).
+  IMAGE_BASE: ghcr.io/${{ github.repository }}/tools
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install QEMU for arm64 cross-compilation on the amd64 runner.
+      # Only arm64 is needed — the runner already runs amd64 natively.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # Create a multi-platform buildx builder backed by the container driver.
+      # The default `docker` driver doesn't support multi-platform or the gha
+      # cache backend.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Determine the protobuf version to build.
+      # - workflow_dispatch:  use the explicit input
+      # - push (Dockerfile change): extract the default from ARG PROTOBUF_TAG=
+      #   in Dockerfile.tools so the version stays in sync with the file.
+      #
+      # The input is passed via an environment variable rather than being
+      # interpolated directly into the shell script to prevent command injection.
+      - name: Resolve protobuf version
+        id: proto
+        env:
+          INPUT_VERSION: ${{ inputs.protobuf_version }}
+          IMAGE_BASE: ${{ env.IMAGE_BASE }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION=$(grep '^ARG PROTOBUF_TAG=' conformance/Dockerfile.tools \
+                      | cut -d= -f2)
+          fi
+          echo "version=${VERSION}"  >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE_BASE}:${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: conformance/Dockerfile.tools
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.proto.outputs.image }}
+          build-args: PROTOBUF_TAG=${{ steps.proto.outputs.version }}
+
+          # Buildkit-native SLSA provenance + SPDX SBOM attached as OCI
+          # referrers to the image index. mode=max includes full build
+          # metadata (Dockerfile, build args, VCS info); the only build
+          # arg here is PROTOBUF_TAG, not sensitive.
+          provenance: mode=max
+          sbom: true
+
+          # GHA cache backend — layers are stored in the GitHub Actions cache
+          # and reused across runs.  A shared scope ensures both trigger paths
+          # (dispatch and path-push) draw from the same cache pool.
+          #
+          # mode=max: cache every intermediate layer, not just the final stage.
+          # This is important here because the expensive work (cloning abseil,
+          # running cmake, compiling protobuf) all happens in intermediate
+          # layers of the builder stage.
+          #
+          # Cache size note: protobuf + abseil compilation produces substantial
+          # intermediate layers.  GitHub's default cache limit is 10 GB per
+          # repo; if the cache is evicted, the next run rebuilds from scratch
+          # (still correct, just slower).
+          cache-from: type=gha,scope=tools-image
+          cache-to:   type=gha,scope=tools-image,mode=max
+
+      # GitHub-native signed SLSA provenance. Stored in the GitHub
+      # attestation API and pushed to GHCR as an OCI referrer.
+      #
+      # Verify with:
+      #   gh attestation verify oci://ghcr.io/<owner>/buffa/tools:v33.5 \
+      #     --repo <owner>/buffa
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_BASE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # Keyless cosign signature — publishes to the Rekor transparency log.
+      # Signs the immutable digest, not the movable tag.
+      #
+      # Verify with:
+      #   cosign verify ghcr.io/<owner>/buffa/tools:v33.5 \
+      #     --certificate-identity-regexp "github.com/<owner>/buffa/.github/workflows/tools-image.yml@" \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign image
+        env:
+          IMAGE_DIGEST: ${{ env.IMAGE_BASE }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_DIGEST"
+
+      - name: Image summary
+        env:
+          IMAGE: ${{ steps.proto.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.proto.outputs.version }}
+        run: |
+          {
+            echo "### Tools image built"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Image** | \`${IMAGE}\` |"
+            echo "| **Digest** | \`${DIGEST}\` |"
+            echo "| **Protobuf** | \`${VERSION}\` |"
+            echo "| **Platforms** | \`linux/amd64\`, \`linux/arm64\` |"
+            echo "| **Statically linked** | ✓ (Alpine/musl) |"
+            echo "| **SLSA provenance** | ✓ buildkit + GitHub attestation |"
+            echo "| **Cosign signature** | ✓ keyless (Sigstore OIDC) |"
+            echo "| **SBOM** | ✓ SPDX |"
+          } >> "$GITHUB_STEP_SUMMARY"

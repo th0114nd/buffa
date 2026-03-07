@@ -1,0 +1,19 @@
+/target
+# Conformance proto files are fetched from the tools image.
+conformance/protos/
+conformance/target-nostd/
+
+# Cargo build artefacts
+target/
+benchmarks/results/
+benchmarks/charts/__pycache__/
+
+# Stress test output
+stress/googleapis/out/
+.task/
+
+# fuzz testing corpus
+fuzz/corpus/
+
+# Local tooling extracted from the tools image (task install-protoc).
+/.local/

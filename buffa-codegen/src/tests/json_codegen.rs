@@ -1,0 +1,372 @@
+//! JSON/serde codegen: custom derive, field attrs, enum proto-name handling,
+//! oneof flatten + null/duplicate handling.
+
+use super::*;
+
+// ── JSON codegen tests ─────────────────────────────────────────────────
+
+fn json_config() -> CodeGenConfig {
+    CodeGenConfig {
+        generate_json: true,
+        generate_views: false,
+        ..CodeGenConfig::default()
+    }
+}
+
+#[test]
+fn test_json_enum_has_custom_impls_and_from_proto_name() {
+    let mut file = proto3_file("color.proto");
+    file.enum_type.push(EnumDescriptorProto {
+        name: Some("Color".to_string()),
+        value: vec![
+            enum_value("RED", 0),
+            enum_value("GREEN", 1),
+            enum_value("BLUE", 2),
+        ],
+        ..Default::default()
+    });
+    let files =
+        generate(&[file], &["color.proto".to_string()], &json_config()).expect("should generate");
+    let content = &files[0].content;
+    // Custom Serialize impl uses proto_name
+    assert!(
+        content.contains("impl ::serde::Serialize for Color"),
+        "missing custom Serialize impl on enum: {content}"
+    );
+    // Custom Deserialize impl
+    assert!(
+        content.contains("impl<'de> ::serde::Deserialize<'de> for Color"),
+        "missing custom Deserialize impl on enum: {content}"
+    );
+    assert!(
+        content.contains("fn from_proto_name"),
+        "missing from_proto_name impl: {content}"
+    );
+    assert!(
+        content.contains(r#""RED" => ::core::option::Option::Some(Self::RED)"#),
+        "missing RED arm in from_proto_name: {content}"
+    );
+}
+
+#[test]
+fn test_json_enum_alias_in_from_proto_name() {
+    let mut file = proto3_file("status.proto");
+    file.enum_type.push(EnumDescriptorProto {
+        name: Some("Status".to_string()),
+        value: vec![
+            enum_value("UNKNOWN", 0),
+            enum_value("STARTED", 1),
+            enum_value("RUNNING", 1), // alias for STARTED
+        ],
+        options: (crate::generated::descriptor::EnumOptions {
+            allow_alias: Some(true),
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    });
+    let files =
+        generate(&[file], &["status.proto".to_string()], &json_config()).expect("should generate");
+    let content = &files[0].content;
+    // Primary name must be in from_proto_name
+    assert!(
+        content.contains(r#""STARTED" => ::core::option::Option::Some(Self::STARTED)"#),
+        "missing STARTED arm: {content}"
+    );
+    // Alias name must also map to the primary variant
+    assert!(
+        content.contains(r#""RUNNING" => ::core::option::Option::Some(Self::STARTED)"#),
+        "missing RUNNING alias arm: {content}"
+    );
+}
+
+#[test]
+fn test_json_message_has_derive_and_field_attrs() {
+    let mut file = proto3_file("scalars_json.proto");
+    file.message_type.push(DescriptorProto {
+        name: Some("Msg".to_string()),
+        field: vec![
+            FieldDescriptorProto {
+                name: Some("count".to_string()),
+                number: Some(1),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_INT32),
+                json_name: Some("count".to_string()),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("big_num".to_string()),
+                number: Some(2),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_INT64),
+                json_name: Some("bigNum".to_string()),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("data".to_string()),
+                number: Some(3),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_BYTES),
+                json_name: Some("data".to_string()),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("ratio".to_string()),
+                number: Some(4),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_FLOAT),
+                json_name: Some("ratio".to_string()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+
+    let files = generate(&[file], &["scalars_json.proto".to_string()], &json_config())
+        .expect("should generate");
+    let content = &files[0].content;
+    // Struct gets serde derive and default
+    assert!(
+        content.contains("derive(::serde::Serialize, ::serde::Deserialize)"),
+        "missing serde derive on struct: {content}"
+    );
+    assert!(
+        content.contains("serde(default)"),
+        "missing #[serde(default)] on struct: {content}"
+    );
+    // i32 field: rename + skip_serializing_if
+    assert!(
+        content.contains(r#"rename = "count""#),
+        "missing rename for count: {content}"
+    );
+    assert!(
+        content.contains("is_zero_i32"),
+        "missing skip_serializing_if for count: {content}"
+    );
+    // i64 field: rename + with + skip_serializing_if
+    assert!(
+        content.contains(r#"with = "::buffa::json_helpers::int64""#),
+        "missing int64 with attr: {content}"
+    );
+    assert!(
+        content.contains("is_zero_i64"),
+        "missing skip_serializing_if for bigNum: {content}"
+    );
+    // bytes field: rename + with + skip_serializing_if
+    assert!(
+        content.contains(r#"with = "::buffa::json_helpers::bytes""#),
+        "missing bytes with attr: {content}"
+    );
+    assert!(
+        content.contains("is_empty_bytes"),
+        "missing skip_serializing_if for data: {content}"
+    );
+    // float field: rename + with + skip_serializing_if
+    assert!(
+        content.contains(r#"with = "::buffa::json_helpers::float""#),
+        "missing float with attr: {content}"
+    );
+    assert!(
+        content.contains("is_zero_f32"),
+        "missing skip_serializing_if for ratio: {content}"
+    );
+    // cached_size gets skip
+    assert!(
+        content.contains("serde(skip)"),
+        "missing serde(skip) for cached_size: {content}"
+    );
+}
+
+#[test]
+fn test_json_oneof_field_is_flattened() {
+    let mut file = proto3_file("oneof_json.proto");
+    file.message_type.push(DescriptorProto {
+        name: Some("WithOneof".to_string()),
+        field: vec![FieldDescriptorProto {
+            name: Some("count".to_string()),
+            number: Some(1),
+            label: Some(Label::LABEL_OPTIONAL),
+            r#type: Some(Type::TYPE_INT32),
+            oneof_index: Some(0),
+            json_name: Some("count".to_string()),
+            ..Default::default()
+        }],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("kind".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let files = generate(&[file], &["oneof_json.proto".to_string()], &json_config())
+        .expect("should generate");
+    let content = &files[0].content;
+    // The oneof field uses flatten so its variants appear as top-level JSON fields.
+    assert!(
+        content.contains("serde(flatten)"),
+        "oneof field must have serde(flatten): {content}"
+    );
+    // The oneof enum must have a custom Serialize impl.
+    assert!(
+        content.contains("impl serde::Serialize for Kind"),
+        "oneof enum must have Serialize impl: {content}"
+    );
+}
+
+#[test]
+fn test_json_oneof_deserialize_null_and_duplicate_handling() {
+    let mut file = proto3_file("oneof_deser.proto");
+    file.message_type.push(DescriptorProto {
+        name: Some("WithOneof".to_string()),
+        field: vec![
+            FieldDescriptorProto {
+                name: Some("count".to_string()),
+                number: Some(1),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_INT32),
+                oneof_index: Some(0),
+                json_name: Some("count".to_string()),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("name".to_string()),
+                number: Some(2),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_STRING),
+                oneof_index: Some(0),
+                json_name: Some("name".to_string()),
+                ..Default::default()
+            },
+        ],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("kind".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let files = generate(&[file], &["oneof_deser.proto".to_string()], &json_config())
+        .expect("should generate");
+    let content = &files[0].content;
+
+    // Null handling: each arm wraps with NullableDeserializeSeed
+    assert!(
+        content.contains("NullableDeserializeSeed"),
+        "oneof deserialize must use NullableDeserializeSeed: {content}"
+    );
+
+    // Duplicate detection: check for is_some() guard on the oneof variable
+    assert!(
+        content.contains("__oneof_kind.is_some()"),
+        "oneof deserialize must check for duplicate fields: {content}"
+    );
+
+    // Helper-using type (int32) should define _DeserSeed struct
+    assert!(
+        content.contains("struct _DeserSeed"),
+        "helper-using variant must define _DeserSeed: {content}"
+    );
+
+    // Custom Deserialize is on the message, not the oneof enum
+    assert!(
+        content.contains("Deserialize<'de> for WithOneof"),
+        "message must have custom Deserialize impl: {content}"
+    );
+    assert!(
+        !content.contains("Deserialize<'de> for Kind"),
+        "oneof enum must NOT have Deserialize impl: {content}"
+    );
+
+    // Default-serde type (string) should use DefaultDeserializeSeed
+    assert!(
+        content.contains("DefaultDeserializeSeed"),
+        "default-serde variant must use DefaultDeserializeSeed: {content}"
+    );
+}
+
+#[test]
+fn test_json_oneof_value_variant_forwards_null() {
+    // Regression: google.protobuf.Value-typed oneof variants must NOT use
+    // NullableDeserializeSeed (which treats JSON null as "variant absent").
+    // JSON `null` is a VALID value for Value (it means Kind::NullValue),
+    // so null must be forwarded to Value::deserialize.
+    let mut file = proto3_file("value_oneof.proto");
+    file.message_type.push(DescriptorProto {
+        name: Some("Wrapper".to_string()),
+        field: vec![
+            FieldDescriptorProto {
+                name: Some("text".to_string()),
+                number: Some(1),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_STRING),
+                oneof_index: Some(0),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("meta".to_string()),
+                number: Some(2),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_MESSAGE),
+                type_name: Some(".google.protobuf.Value".to_string()),
+                oneof_index: Some(0),
+                ..Default::default()
+            },
+        ],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("payload".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    // Need a dummy Value message in the descriptor set so type_name resolves.
+    let mut value_file = proto3_file("google/protobuf/struct.proto");
+    value_file.package = Some("google.protobuf".to_string());
+    value_file.message_type.push(DescriptorProto {
+        name: Some("Value".to_string()),
+        ..Default::default()
+    });
+
+    let files = generate(
+        &[value_file, file],
+        &["value_oneof.proto".to_string()],
+        &json_config(),
+    )
+    .expect("should generate");
+    let content = &files[0].content;
+    // The `meta` (Value) arm should use DefaultDeserializeSeed directly
+    // (forward null), not NullableDeserializeSeed (intercept null).
+    // Look for the meta match arm pattern: it should NOT be nullable.
+    // The `text` arm is a string type — it WILL use NullableDeserializeSeed.
+    // So: count NullableDeserializeSeed uses. Should be 1 (text), not 2.
+    let nullable_count = content.matches("NullableDeserializeSeed").count();
+    assert_eq!(
+        nullable_count, 1,
+        "Value variant must NOT use NullableDeserializeSeed (only text should): {content}"
+    );
+}
+
+#[test]
+fn test_no_serde_attrs_without_generate_json_flag() {
+    let mut file = proto3_file("plain.proto");
+    file.message_type.push(DescriptorProto {
+        name: Some("Msg".to_string()),
+        field: vec![make_field(
+            "big_num",
+            1,
+            Label::LABEL_OPTIONAL,
+            Type::TYPE_INT64,
+        )],
+        ..Default::default()
+    });
+    let files = generate(
+        &[file],
+        &["plain.proto".to_string()],
+        &CodeGenConfig::default(),
+    )
+    .expect("should generate");
+    let content = &files[0].content;
+    assert!(
+        !content.contains("serde"),
+        "serde attrs must be absent without generate_json: {content}"
+    );
+}
