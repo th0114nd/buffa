@@ -92,8 +92,16 @@ impl SizeCache {
     /// generated code this indicates a codegen bug; for manual `Message`
     /// implementations it indicates a traversal-order mismatch.
     #[inline]
+    #[track_caller]
     pub fn next_size(&mut self) -> u32 {
-        let size = self.sizes[self.cursor];
+        let size = *self.sizes.get(self.cursor).unwrap_or_else(|| {
+            panic!(
+                "SizeCache cursor overrun: write_to consumed {} slots but \
+                 compute_size produced {} (traversal-order mismatch)",
+                self.cursor + 1,
+                self.sizes.len()
+            )
+        });
         self.cursor += 1;
         size
     }

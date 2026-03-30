@@ -2483,6 +2483,12 @@ fn map_compute_size_stmt(
     let val_const = map_element_size_is_constant(val_ty);
     // Iterate only the side(s) whose size varies: avoids unused-variable
     // and clippy::for_kv_map lints for bool/fixed* map key or value types.
+    //
+    // The (true, false) arm uses `.values()` here while `map_write_to_stmt`
+    // uses `for (k, v) in &map`. Cache slot order must match between the two
+    // passes. For HashMap (both std and hashbrown), `.values()` and `.iter()`
+    // walk the same table slots in the same order — identical sequence for an
+    // unmodified instance, which `&self` guarantees across both passes.
     Ok(match (key_const, val_const) {
         (true, true) => quote! {
             {
