@@ -125,15 +125,22 @@ fn collect_variant_info(
 /// When JSON is enabled, the containing message always gets a hand-generated
 /// `Deserialize` impl that handles oneof fields inline (`generate_custom_deserialize`
 /// in `message.rs`), so the oneof enum only needs `Serialize`.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_oneof_enum(
     ctx: &CodeGenContext,
     msg: &DescriptorProto,
+    idx: usize,
     oneof: &OneofDescriptorProto,
     current_package: &str,
     proto_fqn: &str,
     features: &ResolvedFeatures,
     resolver: &crate::imports::ImportResolver,
+    oneof_idents: &std::collections::HashMap<usize, proc_macro2::Ident>,
 ) -> Result<TokenStream, CodeGenError> {
+    let rust_enum_ident = match oneof_idents.get(&idx) {
+        Some(id) => id.clone(),
+        None => return Ok(TokenStream::new()),
+    };
     let oneof_name = oneof
         .name
         .as_deref()
@@ -151,9 +158,6 @@ pub fn generate_oneof_enum(
     if variants_info.is_empty() {
         return Ok(TokenStream::new());
     }
-
-    let reserved_names = reserved_names_for_msg(msg);
-    let rust_enum_ident = oneof_enum_ident(oneof_name, &reserved_names)?;
 
     let variants: Vec<_> = variants_info
         .iter()
@@ -498,6 +502,36 @@ pub(crate) fn oneof_enum_ident(
     } else {
         Ok(format_ident!("{}", pascal))
     }
+}
+
+/// Compute oneof enum identifiers for all non-synthetic oneofs in a message.
+///
+/// Processes oneofs sequentially, growing the reserved set after each
+/// allocation to prevent later oneofs from colliding with earlier ones'
+/// suffixed names (e.g. `my_field` → `MyFieldOneof` reserves that name
+/// so `my_field_oneof` cannot also claim `MyFieldOneof`).
+///
+/// Returns a map from oneof declaration index to its Rust enum `Ident`.
+/// Synthetic oneofs (proto3 `optional`) are omitted.
+pub(crate) fn resolve_oneof_idents(
+    msg: &DescriptorProto,
+) -> Result<std::collections::HashMap<usize, Ident>, CodeGenError> {
+    let mut reserved = reserved_names_for_msg(msg);
+    let mut result = std::collections::HashMap::new();
+    for (idx, oneof) in msg.oneof_decl.iter().enumerate() {
+        let has_real_fields = msg.field.iter().any(|f| {
+            crate::impl_message::is_real_oneof_member(f) && f.oneof_index == Some(idx as i32)
+        });
+        if !has_real_fields {
+            continue;
+        }
+        if let Some(oneof_name) = &oneof.name {
+            let ident = oneof_enum_ident(oneof_name, &reserved)?;
+            reserved.insert(ident.to_string());
+            result.insert(idx, ident);
+        }
+    }
+    Ok(result)
 }
 
 /// Convert a snake_case identifier to PascalCase.

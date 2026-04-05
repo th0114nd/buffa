@@ -329,6 +329,62 @@ fn test_oneof_suffix_double_collision_errors() {
 }
 
 #[test]
+fn test_sibling_oneofs_get_distinct_names() {
+    // nested message "MyField", oneof "my_field" → MyFieldOneof,
+    // oneof "my_field_oneof" → would naturally be MyFieldOneof too.
+    // Sequential allocation must assign distinct names.
+    let msg = DescriptorProto {
+        name: Some("Parent".to_string()),
+        nested_type: vec![DescriptorProto {
+            name: Some("MyField".to_string()),
+            ..Default::default()
+        }],
+        oneof_decl: vec![
+            OneofDescriptorProto {
+                name: Some("my_field".to_string()),
+                ..Default::default()
+            },
+            OneofDescriptorProto {
+                name: Some("my_field_oneof".to_string()),
+                ..Default::default()
+            },
+        ],
+        field: vec![
+            {
+                let mut f = make_field("a", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+                f.oneof_index = Some(0);
+                f
+            },
+            {
+                let mut f = make_field("b", 2, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+                f.oneof_index = Some(1);
+                f
+            },
+        ],
+        ..Default::default()
+    };
+    let mut file = proto3_file("test.proto");
+    file.package = Some("pkg".to_string());
+    file.message_type = vec![msg];
+
+    let config = CodeGenConfig {
+        generate_views: false,
+        ..Default::default()
+    };
+    let result = generate(&[file], &["test.proto".to_string()], &config);
+    let files = result.expect("sibling oneofs should get distinct names");
+    let content = &files[0].content;
+    assert!(
+        content.contains("MyFieldOneof"),
+        "first oneof should be suffixed: {content}"
+    );
+    assert!(
+        content.contains("MyFieldOneofOneof"),
+        "second oneof should be double-suffixed: {content}"
+    );
+}
+
+#[test]
 fn test_view_name_conflict_detected() {
     // Messages "Foo" and "FooView" — Foo's view type collides with FooView struct.
     let mut file = proto3_file("test.proto");
