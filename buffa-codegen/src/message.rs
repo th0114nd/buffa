@@ -521,7 +521,7 @@ pub fn generate_message(
                     nested_name,
                     &nested_fqn,
                     features,
-                    struct_nesting + 1,
+                    view_skip_fqns,
                 )?;
                 nested_items.extend(view_top);
                 view_mod

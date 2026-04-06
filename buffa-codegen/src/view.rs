@@ -8,6 +8,19 @@
 //!   but with borrowed variants.
 //! - `impl MessageView<'a> for FooView<'a>`: provides `decode_view` (zero-copy
 //!   decode) and `to_owned_message` (conversion to the owned type).
+//!
+//! # Skipped views (`Foo` + `FooView` message collision)
+//!
+//! When a sibling message named `{Name}View` forces codegen to skip `NameView<'a>`,
+//! fields typed as `Name` use owned [`::buffa::MessageField`] / [`::buffa::alloc::vec::Vec`]
+//! in parent views instead of zero-copy view types.
+//!
+//! **Cross-crate limitation:** `view_skip_fqns` is computed per codegen invocation
+//! from the current descriptor set only. A crate that imports messages via
+//! `extern_path` does not learn which dependency messages had views skipped; references
+//! may still emit `DependencyView<'a>` incorrectly until skip metadata is propagated.
+
+use std::collections::HashSet;
 
 use crate::generated::descriptor::field_descriptor_proto::{Label, Type};
 use crate::generated::descriptor::{DescriptorProto, FieldDescriptorProto, OneofDescriptorProto};
@@ -25,6 +38,16 @@ use crate::impl_message::{
 use crate::message::{is_closed_enum, is_map_field, make_field_ident, rust_path_to_tokens};
 use crate::oneof::to_pascal_case;
 use crate::CodeGenError;
+
+/// Proto fully-qualified name of a field's message or group type, without a leading dot.
+fn message_field_proto_fqn(field: &FieldDescriptorProto) -> Option<&str> {
+    field.type_name.as_deref().and_then(|n| n.strip_prefix('.'))
+}
+
+fn message_field_view_skipped(field: &FieldDescriptorProto, view_skip_fqns: &HashSet<String>) -> bool {
+    message_field_proto_fqn(field)
+        .is_some_and(|fqn| view_skip_fqns.contains(fqn))
+}
 
 /// Token stream that pushes a closed-enum unknown value's raw wire span to
 /// `view.__buffa_unknown_fields`. Requires `before_tag` and `cur` in scope
@@ -74,7 +97,7 @@ pub fn generate_view(
     rust_name: &str,
     proto_fqn: &str,
     features: &ResolvedFeatures,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<(TokenStream, TokenStream), CodeGenError> {
     let proto_name = msg.name.as_deref().unwrap_or(rust_name);
     let mod_name_str = crate::oneof::to_snake_case(proto_name);
@@ -94,15 +117,31 @@ pub fn generate_view(
         .field
         .iter()
         .filter(|f| is_supported_field_type(f.r#type.unwrap_or_default()))
-        .map(|f| view_struct_field(ctx, msg, f, current_package, proto_fqn, features, struct_nesting))
+        .map(|f| {
+            view_struct_field(
+                ctx,
+                msg,
+                f,
+                current_package,
+                proto_fqn,
+                features,
+                view_skip_fqns,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
 
     // One `Option<KindView<'a>>` per non-synthetic oneof (module-qualified).
-    let oneof_struct_fields =
-        oneof_view_struct_fields(ctx, msg, &mod_ident, features, &oneof_idents)?;
+    let oneof_struct_fields = oneof_view_struct_fields(
+        ctx,
+        msg,
+        &mod_ident,
+        features,
+        &oneof_idents,
+        view_skip_fqns,
+    )?;
 
     // Oneof view enum definitions (go inside the module).
     let oneof_view_enums = msg
@@ -110,13 +149,29 @@ pub fn generate_view(
         .iter()
         .enumerate()
         .map(|(idx, oneof)| {
-            generate_oneof_view_enum(ctx, msg, idx, oneof, current_package, features, &oneof_idents, struct_nesting + 1)
+            generate_oneof_view_enum(
+                ctx,
+                msg,
+                idx,
+                oneof,
+                current_package,
+                features,
+                &oneof_idents,
+                view_skip_fqns,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // decode_view match arms.
-    let (scalar_arms, repeated_arms, oneof_arms) =
-        build_decode_arms(ctx, msg, current_package, &mod_ident, features, &oneof_idents, struct_nesting)?;
+    let (scalar_arms, repeated_arms, oneof_arms) = build_decode_arms(
+        ctx,
+        msg,
+        current_package,
+        &mod_ident,
+        features,
+        &oneof_idents,
+        view_skip_fqns,
+    )?;
 
     // to_owned_message field initialisers.
     let owned_fields = build_to_owned_fields(
@@ -128,7 +183,7 @@ pub fn generate_view(
         &mod_ident,
         ctx.config.preserve_unknown_fields,
         &oneof_idents,
-        struct_nesting,
+        view_skip_fqns,
     )?;
 
     let unknown_fields_field = if ctx.config.preserve_unknown_fields {
@@ -156,9 +211,13 @@ pub fn generate_view(
     // If no field borrows from 'a (all-scalar message with unknown-fields
     // preservation disabled), inject PhantomData<&'a ()> so the struct's
     // lifetime param is used. _decode_depth(buf: &'a [u8]) requires 'a.
-    let phantom_field =
-        if message_view_has_borrowing_field(ctx, msg, features, ctx.config.preserve_unknown_fields)
-        {
+    let phantom_field = if message_view_has_borrowing_field(
+        ctx,
+        msg,
+        features,
+        ctx.config.preserve_unknown_fields,
+        view_skip_fqns,
+    ) {
             quote! {}
         } else {
             quote! { #[doc(hidden)] pub __buffa_phantom: ::core::marker::PhantomData<&'a ()>, }
@@ -296,7 +355,6 @@ pub fn generate_view(
 // View struct field declarations
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn view_struct_field(
     ctx: &CodeGenContext,
     msg: &DescriptorProto,
@@ -304,7 +362,7 @@ fn view_struct_field(
     current_package: &str,
     proto_fqn: &str,
     features: &ResolvedFeatures,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<Option<TokenStream>, CodeGenError> {
     // Real oneof members go into the oneof enum, not directly on the struct.
     if is_real_oneof_member(field) {
@@ -325,7 +383,7 @@ fn view_struct_field(
         let number = field.number.unwrap_or(0);
         let tag_line = format!("Field {number}: `{field_name}` (map)");
         let doc = crate::comments::doc_attrs_with_tag(proto_comment, &tag_line);
-        let map_ty = view_map_type(ctx, msg, field, current_package, features, struct_nesting)?;
+        let map_ty = view_map_type(ctx, msg, field, current_package, features, view_skip_fqns)?;
         return Ok(Some(quote! {
             #doc
             pub #ident: #map_ty,
@@ -338,9 +396,9 @@ fn view_struct_field(
     let doc = crate::comments::doc_attrs_with_tag(proto_comment, &tag_line);
 
     let rust_type = if is_repeated {
-        view_repeated_type(ctx, field, current_package, features, struct_nesting)?
+        view_repeated_type(ctx, field, current_package, features, view_skip_fqns)?
     } else {
-        view_singular_type(ctx, field, current_package, features, struct_nesting)?
+        view_singular_type(ctx, field, current_package, features, view_skip_fqns)?
     };
 
     // Self-referential view fields (e.g. HttpRuleView.additional_bindings)
@@ -349,7 +407,9 @@ fn view_struct_field(
     // struct fields; decode and to_owned paths use the resolved type as-is
     // via the helper functions so no conflict there.
     let self_fqn = format!(".{proto_fqn}");
-    let struct_ty = if field.type_name.as_deref() == Some(self_fqn.as_str()) {
+    let struct_ty = if field.type_name.as_deref() == Some(self_fqn.as_str())
+        && !message_field_view_skipped(field, view_skip_fqns)
+    {
         if is_repeated {
             quote! { ::buffa::RepeatedView<'a, Self> }
         } else {
@@ -370,7 +430,7 @@ fn view_singular_type(
     field: &FieldDescriptorProto,
     current_package: &str,
     parent_features: &ResolvedFeatures,
-    nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let features = &crate::features::resolve_field(ctx, field, parent_features);
     let ty = effective_type(ctx, field, features);
@@ -380,7 +440,7 @@ fn view_singular_type(
             Type::TYPE_STRING => quote! { ::core::option::Option<&'a str> },
             Type::TYPE_BYTES => quote! { ::core::option::Option<&'a [u8]> },
             Type::TYPE_ENUM => {
-                let et = resolve_enum_ty(ctx, field, current_package, nesting)?;
+                let et = resolve_enum_ty(ctx, field, current_package, 0)?;
                 if is_closed_enum(features) {
                     quote! { ::core::option::Option<#et> }
                 } else {
@@ -398,11 +458,16 @@ fn view_singular_type(
         Type::TYPE_STRING => Ok(quote! { &'a str }),
         Type::TYPE_BYTES => Ok(quote! { &'a [u8] }),
         Type::TYPE_MESSAGE | Type::TYPE_GROUP => {
-            let view_ty = resolve_view_ty_tokens(ctx, field, current_package, nesting)?;
-            Ok(quote! { ::buffa::MessageFieldView<#view_ty> })
+            if message_field_view_skipped(field, view_skip_fqns) {
+                let owned_ty = rust_path_to_tokens(&resolve_owned_path(ctx, field, current_package, 0)?);
+                Ok(quote! { ::buffa::MessageField<#owned_ty> })
+            } else {
+                let view_ty = resolve_view_ty_tokens(ctx, field, current_package, 0)?;
+                Ok(quote! { ::buffa::MessageFieldView<#view_ty> })
+            }
         }
         Type::TYPE_ENUM => {
-            let et = resolve_enum_ty(ctx, field, current_package, nesting)?;
+            let et = resolve_enum_ty(ctx, field, current_package, 0)?;
             if is_closed_enum(features) {
                 Ok(quote! { #et })
             } else {
@@ -418,7 +483,7 @@ fn view_repeated_type(
     field: &FieldDescriptorProto,
     current_package: &str,
     parent_features: &ResolvedFeatures,
-    nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let features = &crate::features::resolve_field(ctx, field, parent_features);
     let ty = effective_type(ctx, field, features);
@@ -426,11 +491,17 @@ fn view_repeated_type(
         Type::TYPE_STRING => Ok(quote! { ::buffa::RepeatedView<'a, &'a str> }),
         Type::TYPE_BYTES => Ok(quote! { ::buffa::RepeatedView<'a, &'a [u8]> }),
         Type::TYPE_MESSAGE | Type::TYPE_GROUP => {
-            let view_ty = resolve_view_ty_tokens(ctx, field, current_package, nesting)?;
-            Ok(quote! { ::buffa::RepeatedView<'a, #view_ty> })
+            if message_field_view_skipped(field, view_skip_fqns) {
+                let owned_ty =
+                    rust_path_to_tokens(&resolve_owned_path(ctx, field, current_package, 0)?);
+                Ok(quote! { ::buffa::alloc::vec::Vec<#owned_ty> })
+            } else {
+                let view_ty = resolve_view_ty_tokens(ctx, field, current_package, 0)?;
+                Ok(quote! { ::buffa::RepeatedView<'a, #view_ty> })
+            }
         }
         Type::TYPE_ENUM => {
-            let et = resolve_enum_ty(ctx, field, current_package, nesting)?;
+            let et = resolve_enum_ty(ctx, field, current_package, 0)?;
             if is_closed_enum(features) {
                 Ok(quote! { ::buffa::RepeatedView<'a, #et> })
             } else {
@@ -445,14 +516,13 @@ fn view_repeated_type(
 }
 
 /// Build the `::buffa::MapView<'a, K, V>` type for a map field.
-#[allow(clippy::too_many_arguments)]
 fn view_map_type(
     ctx: &CodeGenContext,
     msg: &DescriptorProto,
     field: &FieldDescriptorProto,
     current_package: &str,
     features: &ResolvedFeatures,
-    nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let (key_fd, val_fd) = find_map_entry_fields(msg, field)?;
 
@@ -467,11 +537,17 @@ fn view_map_type(
         Type::TYPE_STRING => quote! { &'a str },
         Type::TYPE_BYTES => quote! { &'a [u8] },
         Type::TYPE_MESSAGE => {
-            let view_ty = resolve_view_ty_tokens(ctx, val_fd, current_package, nesting)?;
-            quote! { #view_ty }
+            if message_field_view_skipped(val_fd, view_skip_fqns) {
+                let owned_ty =
+                    rust_path_to_tokens(&resolve_owned_path(ctx, val_fd, current_package, 0)?);
+                quote! { #owned_ty }
+            } else {
+                let view_ty = resolve_view_ty_tokens(ctx, val_fd, current_package, 0)?;
+                quote! { #view_ty }
+            }
         }
         Type::TYPE_ENUM => {
-            let et = resolve_enum_ty(ctx, val_fd, current_package, nesting)?;
+            let et = resolve_enum_ty(ctx, val_fd, current_package, 0)?;
             let val_features = crate::features::resolve_field(ctx, val_fd, features);
             if is_closed_enum(&val_features) {
                 quote! { #et }
@@ -494,12 +570,14 @@ fn oneof_view_needs_lifetime(
     ctx: &CodeGenContext,
     fields: &[&FieldDescriptorProto],
     features: &ResolvedFeatures,
+    view_skip_fqns: &HashSet<String>,
 ) -> bool {
     fields.iter().any(|f| {
-        matches!(
-            effective_type(ctx, f, features),
-            Type::TYPE_STRING | Type::TYPE_BYTES | Type::TYPE_MESSAGE | Type::TYPE_GROUP
-        )
+        match effective_type(ctx, f, features) {
+            Type::TYPE_STRING | Type::TYPE_BYTES => true,
+            Type::TYPE_MESSAGE | Type::TYPE_GROUP => !message_field_view_skipped(f, view_skip_fqns),
+            _ => false,
+        }
     })
 }
 
@@ -514,6 +592,7 @@ fn message_view_has_borrowing_field(
     msg: &DescriptorProto,
     features: &ResolvedFeatures,
     preserve_unknown_fields: bool,
+    view_skip_fqns: &HashSet<String>,
 ) -> bool {
     if preserve_unknown_fields {
         // UnknownFieldsView<'a> always uses 'a.
@@ -523,15 +602,31 @@ fn message_view_has_borrowing_field(
         if is_real_oneof_member(f) {
             continue; // oneof members checked below via oneof_view_needs_lifetime
         }
-        // Repeated and map fields always use 'a (RepeatedView<'a, T>, MapView<'a, K, V>).
+        // Repeated and map fields usually use 'a (RepeatedView / MapView). Skipped nested
+        // messages use `Vec<T>` (no buffer borrow on the element type).
         if f.label.unwrap_or_default()
             == crate::generated::descriptor::field_descriptor_proto::Label::LABEL_REPEATED
         {
+            if is_map_field(msg, f) {
+                return true;
+            }
+            let ty = effective_type(ctx, f, features);
+            if matches!(ty, Type::TYPE_MESSAGE | Type::TYPE_GROUP)
+                && message_field_view_skipped(f, view_skip_fqns)
+            {
+                continue;
+            }
             return true;
         }
-        // Singular string/bytes/message/group borrow.
+        // Singular string/bytes/message/group borrow — except skipped messages (owned heap).
+        let ty = effective_type(ctx, f, features);
+        if matches!(ty, Type::TYPE_MESSAGE | Type::TYPE_GROUP)
+            && message_field_view_skipped(f, view_skip_fqns)
+        {
+            continue;
+        }
         if matches!(
-            effective_type(ctx, f, features),
+            ty,
             Type::TYPE_STRING | Type::TYPE_BYTES | Type::TYPE_MESSAGE | Type::TYPE_GROUP
         ) {
             return true;
@@ -545,7 +640,7 @@ fn message_view_has_borrowing_field(
             .iter()
             .filter(|f| is_real_oneof_member(f) && f.oneof_index == Some(idx as i32))
             .collect();
-        if oneof_view_needs_lifetime(ctx, &fields, features) {
+        if oneof_view_needs_lifetime(ctx, &fields, features, view_skip_fqns) {
             return true;
         }
     }
@@ -558,6 +653,7 @@ fn oneof_view_struct_fields(
     mod_ident: &proc_macro2::Ident,
     features: &ResolvedFeatures,
     oneof_idents: &std::collections::HashMap<usize, proc_macro2::Ident>,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<Vec<TokenStream>, CodeGenError> {
     let mut out = Vec::new();
     for (idx, oneof) in msg.oneof_decl.iter().enumerate() {
@@ -579,7 +675,7 @@ fn oneof_view_struct_fields(
             .ok_or(CodeGenError::MissingField("oneof.name"))?;
         let field_ident = make_field_ident(oneof_name);
         let view_enum = format_ident!("{}View", base_ident);
-        let generics = if oneof_view_needs_lifetime(ctx, &fields, features) {
+        let generics = if oneof_view_needs_lifetime(ctx, &fields, features, view_skip_fqns) {
             quote! { <'a> }
         } else {
             quote! {}
@@ -595,7 +691,6 @@ fn oneof_view_struct_fields(
 // Oneof view enum
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn generate_oneof_view_enum(
     ctx: &CodeGenContext,
     msg: &DescriptorProto,
@@ -604,7 +699,7 @@ fn generate_oneof_view_enum(
     current_package: &str,
     features: &ResolvedFeatures,
     oneof_idents: &std::collections::HashMap<usize, proc_macro2::Ident>,
-    module_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let base_ident = match oneof_idents.get(&idx) {
         Some(id) => id,
@@ -637,11 +732,17 @@ fn generate_oneof_view_enum(
                 Type::TYPE_STRING => quote! { &'a str },
                 Type::TYPE_BYTES => quote! { &'a [u8] },
                 Type::TYPE_MESSAGE | Type::TYPE_GROUP => {
-                    let view_ty = resolve_view_ty_tokens(ctx, f, current_package, module_nesting)?;
-                    quote! { ::buffa::alloc::boxed::Box<#view_ty> }
+                    if message_field_view_skipped(f, view_skip_fqns) {
+                        let owned_ty =
+                            rust_path_to_tokens(&resolve_owned_path(ctx, f, current_package, 1)?);
+                        quote! { ::buffa::alloc::boxed::Box<#owned_ty> }
+                    } else {
+                        let view_ty = resolve_view_ty_tokens(ctx, f, current_package, 1)?;
+                        quote! { ::buffa::alloc::boxed::Box<#view_ty> }
+                    }
                 }
                 Type::TYPE_ENUM => {
-                    let et = resolve_enum_ty(ctx, f, current_package, module_nesting)?;
+                    let et = resolve_enum_ty(ctx, f, current_package, 1)?;
                     if is_closed_enum(&f_features) {
                         quote! { #et }
                     } else {
@@ -654,7 +755,7 @@ fn generate_oneof_view_enum(
         })
         .collect::<Result<Vec<_>, CodeGenError>>()?;
 
-    let generics = if oneof_view_needs_lifetime(ctx, &fields, features) {
+    let generics = if oneof_view_needs_lifetime(ctx, &fields, features, view_skip_fqns) {
         quote! { <'a> }
     } else {
         quote! {}
@@ -673,7 +774,6 @@ fn generate_oneof_view_enum(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::type_complexity)]
-#[allow(clippy::too_many_arguments)]
 fn build_decode_arms(
     ctx: &CodeGenContext,
     msg: &DescriptorProto,
@@ -681,7 +781,7 @@ fn build_decode_arms(
     mod_ident: &proc_macro2::Ident,
     features: &ResolvedFeatures,
     oneof_idents: &std::collections::HashMap<usize, proc_macro2::Ident>,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<(Vec<TokenStream>, Vec<TokenStream>, Vec<TokenStream>), CodeGenError> {
     let preserve_unknown_fields = ctx.config.preserve_unknown_fields;
     let scalar_fields: Vec<_> = msg
@@ -697,7 +797,16 @@ fn build_decode_arms(
         .collect();
     let scalar_arms = scalar_fields
         .iter()
-        .map(|f| scalar_decode_arm(ctx, f, current_package, features, preserve_unknown_fields, struct_nesting))
+        .map(|f| {
+            scalar_decode_arm(
+                ctx,
+                f,
+                current_package,
+                features,
+                preserve_unknown_fields,
+                view_skip_fqns,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let repeated_fields: Vec<_> = msg
@@ -711,7 +820,16 @@ fn build_decode_arms(
         .collect();
     let mut repeated_arms: Vec<_> = repeated_fields
         .iter()
-        .map(|f| repeated_decode_arm(ctx, f, current_package, features, preserve_unknown_fields, struct_nesting))
+        .map(|f| {
+            repeated_decode_arm(
+                ctx,
+                f,
+                current_package,
+                features,
+                preserve_unknown_fields,
+                view_skip_fqns,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Map fields: decode entries into MapView.
@@ -722,7 +840,7 @@ fn build_decode_arms(
         .collect();
     let map_arms = map_fields
         .iter()
-        .map(|f| map_decode_arm(ctx, msg, f, current_package, features, struct_nesting))
+        .map(|f| map_decode_arm(ctx, msg, f, current_package, features, view_skip_fqns))
         .collect::<Result<Vec<_>, _>>()?;
     repeated_arms.extend(map_arms);
 
@@ -750,7 +868,7 @@ fn build_decode_arms(
             mod_ident,
             features,
             preserve_unknown_fields,
-            struct_nesting,
+            view_skip_fqns,
         )?);
     }
 
@@ -763,7 +881,7 @@ fn scalar_decode_arm(
     current_package: &str,
     parent_features: &ResolvedFeatures,
     preserve_unknown_fields: bool,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let features = &crate::features::resolve_field(ctx, field, parent_features);
     let field_name = field
@@ -824,34 +942,63 @@ fn scalar_decode_arm(
             }
         }
         Type::TYPE_MESSAGE => {
-            let vt = resolve_view_decode_tokens(ctx, field, current_package, struct_nesting)?;
-            quote! {
-                if depth == 0 {
-                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+            if message_field_view_skipped(field, view_skip_fqns) {
+                quote! {
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                    ::buffa::Message::merge_length_delimited(
+                        view.#ident.get_or_insert_default(),
+                        sub,
+                        depth - 1,
+                    )?;
                 }
-                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                // Proto merge semantics: if this field appeared before,
-                // merge the new bytes into the existing view.
-                match view.#ident.as_mut() {
-                    Some(existing) => existing._merge_into_view(sub, depth - 1)?,
-                    None => view.#ident = ::buffa::MessageFieldView::set(
-                        #vt::_decode_depth(sub, depth - 1)?
-                    ),
+            } else {
+                let vt = resolve_view_decode_tokens(ctx, field, current_package, 0)?;
+                quote! {
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                    // Proto merge semantics: if this field appeared before,
+                    // merge the new bytes into the existing view.
+                    match view.#ident.as_mut() {
+                        Some(existing) => existing._merge_into_view(sub, depth - 1)?,
+                        None => view.#ident = ::buffa::MessageFieldView::set(
+                            #vt::_decode_depth(sub, depth - 1)?
+                        ),
+                    }
                 }
             }
         }
         Type::TYPE_GROUP => {
-            let vt = resolve_view_decode_tokens(ctx, field, current_package, struct_nesting)?;
-            quote! {
-                if depth == 0 {
-                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+            if message_field_view_skipped(field, view_skip_fqns) {
+                quote! {
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
+                    ::buffa::Message::merge_group(
+                        view.#ident.get_or_insert_default(),
+                        sub,
+                        depth - 1,
+                        #field_number,
+                    )?;
                 }
-                let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
-                match view.#ident.as_mut() {
-                    Some(existing) => existing._merge_into_view(sub, depth - 1)?,
-                    None => view.#ident = ::buffa::MessageFieldView::set(
-                        #vt::_decode_depth(sub, depth - 1)?
-                    ),
+            } else {
+                let vt = resolve_view_decode_tokens(ctx, field, current_package, 0)?;
+                quote! {
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
+                    match view.#ident.as_mut() {
+                        Some(existing) => existing._merge_into_view(sub, depth - 1)?,
+                        None => view.#ident = ::buffa::MessageFieldView::set(
+                            #vt::_decode_depth(sub, depth - 1)?
+                        ),
+                    }
                 }
             }
         }
@@ -870,7 +1017,7 @@ fn repeated_decode_arm(
     current_package: &str,
     parent_features: &ResolvedFeatures,
     preserve_unknown_fields: bool,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let features = &crate::features::resolve_field(ctx, field, parent_features);
     let field_name = field
@@ -888,15 +1035,30 @@ fn repeated_decode_arm(
             &quote! { ::buffa::encoding::WireType::LengthDelimited },
             2u8,
         );
-        let vt = resolve_view_decode_tokens(ctx, field, current_package, struct_nesting)?;
-        return Ok(quote! {
-            #field_number => {
-                #ld_check
-                if depth == 0 {
-                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+        return Ok(if message_field_view_skipped(field, view_skip_fqns) {
+            quote! {
+                #field_number => {
+                    #ld_check
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                    let mut elem = ::core::default::Default::default();
+                    ::buffa::Message::merge_length_delimited(&mut elem, sub, depth - 1)?;
+                    view.#ident.push(elem);
                 }
-                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                view.#ident.push(#vt::_decode_depth(sub, depth - 1)?);
+            }
+        } else {
+            let vt = resolve_view_decode_tokens(ctx, field, current_package, 0)?;
+            quote! {
+                #field_number => {
+                    #ld_check
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                    view.#ident.push(#vt::_decode_depth(sub, depth - 1)?);
+                }
             }
         });
     }
@@ -908,15 +1070,30 @@ fn repeated_decode_arm(
             &quote! { ::buffa::encoding::WireType::StartGroup },
             3u8,
         );
-        let vt = resolve_view_decode_tokens(ctx, field, current_package, struct_nesting)?;
-        return Ok(quote! {
-            #field_number => {
-                #sg_check
-                if depth == 0 {
-                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+        return Ok(if message_field_view_skipped(field, view_skip_fqns) {
+            quote! {
+                #field_number => {
+                    #sg_check
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
+                    let mut elem = ::core::default::Default::default();
+                    ::buffa::Message::merge_group(&mut elem, sub, depth - 1, #field_number)?;
+                    view.#ident.push(elem);
                 }
-                let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
-                view.#ident.push(#vt::_decode_depth(sub, depth - 1)?);
+            }
+        } else {
+            let vt = resolve_view_decode_tokens(ctx, field, current_package, 0)?;
+            quote! {
+                #field_number => {
+                    #sg_check
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
+                    view.#ident.push(#vt::_decode_depth(sub, depth - 1)?);
+                }
             }
         });
     }
@@ -997,7 +1174,7 @@ fn map_decode_arm(
     field: &FieldDescriptorProto,
     current_package: &str,
     features: &ResolvedFeatures,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let field_name = field
         .name
@@ -1031,7 +1208,7 @@ fn map_decode_arm(
         &format_ident!("key"),
         current_package,
         features,
-        struct_nesting,
+        view_skip_fqns,
     )?;
     let decode_val = map_view_entry_decode(
         ctx,
@@ -1039,7 +1216,7 @@ fn map_decode_arm(
         &format_ident!("val"),
         current_package,
         features,
-        struct_nesting,
+        view_skip_fqns,
     )?;
 
     Ok(quote! {
@@ -1072,7 +1249,7 @@ fn map_view_entry_decode(
     var: &proc_macro2::Ident,
     current_package: &str,
     parent_features: &ResolvedFeatures,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let features = &crate::features::resolve_field(ctx, fd, parent_features);
     let ty = effective_type_in_map_entry(ctx, fd, features);
@@ -1099,13 +1276,23 @@ fn map_view_entry_decode(
             }
         }
         Type::TYPE_MESSAGE => {
-            let vt = resolve_view_decode_tokens(ctx, fd, current_package, struct_nesting)?;
-            quote! {
-                if depth == 0 {
-                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+            if message_field_view_skipped(fd, view_skip_fqns) {
+                quote! {
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_bytes(&mut entry_cur)?;
+                    ::buffa::Message::merge_length_delimited(&mut #var, sub, depth - 1)?;
                 }
-                let sub = ::buffa::types::borrow_bytes(&mut entry_cur)?;
-                #var = #vt::_decode_depth(sub, depth - 1)?;
+            } else {
+                let vt = resolve_view_decode_tokens(ctx, fd, current_package, 0)?;
+                quote! {
+                    if depth == 0 {
+                        return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    }
+                    let sub = ::buffa::types::borrow_bytes(&mut entry_cur)?;
+                    #var = #vt::_decode_depth(sub, depth - 1)?;
+                }
             }
         }
         _ => {
@@ -1127,7 +1314,7 @@ fn oneof_decode_arms(
     mod_ident: &proc_macro2::Ident,
     features: &ResolvedFeatures,
     preserve_unknown_fields: bool,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<Vec<TokenStream>, CodeGenError> {
     let field_ident = make_field_ident(oneof_name);
     let view_enum_simple = format_ident!("{}View", base_ident);
@@ -1152,43 +1339,103 @@ fn oneof_decode_arms(
                 Type::TYPE_STRING => quote! { ::buffa::types::borrow_str(&mut cur)? },
                 Type::TYPE_BYTES => quote! { ::buffa::types::borrow_bytes(&mut cur)? },
                 Type::TYPE_MESSAGE => {
-                    let vt = resolve_view_decode_tokens(ctx, field, current_package, struct_nesting)?;
-                    return Ok(quote! {
-                        #field_number => {
-                            #wire_check
-                            if depth == 0 {
-                                return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    // Proto merge semantics: if this same variant is already set,
+                    // merge into the existing boxed view rather than replacing.
+                    // Uses an early `return Ok(...)` since the merge path doesn't
+                    // fit the `value` expression shape used by scalar variants.
+                    return Ok(if message_field_view_skipped(field, view_skip_fqns) {
+                        quote! {
+                            #field_number => {
+                                #wire_check
+                                if depth == 0 {
+                                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                                }
+                                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                                if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
+                                    ::buffa::Message::merge_length_delimited(
+                                        existing.as_mut(),
+                                        sub,
+                                        depth - 1,
+                                    )?;
+                                } else {
+                                    let mut val = ::core::default::Default::default();
+                                    ::buffa::Message::merge_length_delimited(&mut val, sub, depth - 1)?;
+                                    view.#field_ident = Some(#view_enum::#variant(
+                                        ::buffa::alloc::boxed::Box::new(val),
+                                    ));
+                                }
                             }
-                            let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                            if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
-                                existing._merge_into_view(sub, depth - 1)?;
-                            } else {
-                                view.#field_ident = Some(#view_enum::#variant(
-                                    ::buffa::alloc::boxed::Box::new(
-                                        #vt::_decode_depth(sub, depth - 1)?
-                                    )
-                                ));
+                        }
+                    } else {
+                        let vt = resolve_view_decode_tokens(ctx, field, current_package, 0)?;
+                        quote! {
+                            #field_number => {
+                                #wire_check
+                                if depth == 0 {
+                                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                                }
+                                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                                if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
+                                    existing._merge_into_view(sub, depth - 1)?;
+                                } else {
+                                    view.#field_ident = Some(#view_enum::#variant(
+                                        ::buffa::alloc::boxed::Box::new(
+                                            #vt::_decode_depth(sub, depth - 1)?
+                                        )
+                                    ));
+                                }
                             }
                         }
                     });
                 }
                 Type::TYPE_GROUP => {
-                    let vt = resolve_view_decode_tokens(ctx, field, current_package, struct_nesting)?;
-                    return Ok(quote! {
-                        #field_number => {
-                            #wire_check
-                            if depth == 0 {
-                                return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                    return Ok(if message_field_view_skipped(field, view_skip_fqns) {
+                        quote! {
+                            #field_number => {
+                                #wire_check
+                                if depth == 0 {
+                                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                                }
+                                let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
+                                if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
+                                    ::buffa::Message::merge_group(
+                                        existing.as_mut(),
+                                        sub,
+                                        depth - 1,
+                                        #field_number,
+                                    )?;
+                                } else {
+                                    let mut val = ::core::default::Default::default();
+                                    ::buffa::Message::merge_group(
+                                        &mut val,
+                                        sub,
+                                        depth - 1,
+                                        #field_number,
+                                    )?;
+                                    view.#field_ident = Some(#view_enum::#variant(
+                                        ::buffa::alloc::boxed::Box::new(val),
+                                    ));
+                                }
                             }
-                            let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
-                            if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
-                                existing._merge_into_view(sub, depth - 1)?;
-                            } else {
-                                view.#field_ident = Some(#view_enum::#variant(
-                                    ::buffa::alloc::boxed::Box::new(
-                                        #vt::_decode_depth(sub, depth - 1)?
-                                    )
-                                ));
+                        }
+                    } else {
+                        let vt = resolve_view_decode_tokens(ctx, field, current_package, 0)?;
+                        quote! {
+                            #field_number => {
+                                #wire_check
+                                if depth == 0 {
+                                    return Err(::buffa::DecodeError::RecursionLimitExceeded);
+                                }
+                                let sub = ::buffa::types::borrow_group(&mut cur, #field_number, depth - 1)?;
+                                if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
+                                    existing._merge_into_view(sub, depth - 1)?;
+                                } else {
+                                    view.#field_ident = Some(#view_enum::#variant(
+                                        ::buffa::alloc::boxed::Box::new(
+                                            #vt::_decode_depth(sub, depth - 1)?
+                                        )
+                                    ));
+                                }
                             }
                         }
                     });
@@ -1241,7 +1488,7 @@ fn build_to_owned_fields(
     mod_ident: &proc_macro2::Ident,
     preserve_unknown_fields: bool,
     oneof_idents: &std::collections::HashMap<usize, proc_macro2::Ident>,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<Vec<TokenStream>, CodeGenError> {
     let mut out = Vec::new();
 
@@ -1257,13 +1504,29 @@ fn build_to_owned_fields(
         let ident = make_field_ident(name);
         let is_repeated = field.label.unwrap_or_default() == Label::LABEL_REPEATED;
         if is_repeated && is_map_field(msg, field) {
-            let expr = map_to_owned_expr(ctx, msg, field, &ident, current_package, features, struct_nesting)?;
+            let expr = map_to_owned_expr(
+                ctx,
+                msg,
+                field,
+                &ident,
+                current_package,
+                features,
+                view_skip_fqns,
+            )?;
             out.push(quote! { #ident: #expr, });
             continue;
         }
         let ty = effective_type(ctx, field, features);
         let init = if is_repeated {
-            repeated_to_owned(ctx, ty, &ident, proto_fqn, name)?
+            repeated_to_owned(
+                ctx,
+                field,
+                ty,
+                &ident,
+                proto_fqn,
+                name,
+                view_skip_fqns,
+            )?
         } else {
             singular_to_owned(
                 ctx,
@@ -1274,7 +1537,7 @@ fn build_to_owned_fields(
                 proto_fqn,
                 name,
                 features,
-                struct_nesting,
+                view_skip_fqns,
             )?
         };
         out.push(quote! { #ident: #init, });
@@ -1312,7 +1575,7 @@ fn build_to_owned_fields(
                     .ok_or(CodeGenError::MissingField("field.name"))?;
                 let variant = format_ident!("{}", to_pascal_case(fname));
                 let ty = effective_type(ctx, f, features);
-                let conv = oneof_variant_to_owned(ctx, ty, proto_fqn, fname);
+                let conv = oneof_variant_to_owned(ctx, ty, proto_fqn, fname, f, view_skip_fqns);
                 Ok(quote! {
                     #view_enum::#variant(v) => #owned_enum::#variant(#conv),
                 })
@@ -1351,7 +1614,7 @@ fn singular_to_owned(
     proto_fqn: &str,
     field_name: &str,
     features: &ResolvedFeatures,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     if is_explicit_presence_scalar(field, ty, features) {
         return Ok(match ty {
@@ -1367,14 +1630,23 @@ fn singular_to_owned(
         Type::TYPE_STRING => quote! { self.#ident.to_string() },
         Type::TYPE_BYTES => bytes_to_owned(ctx, proto_fqn, field_name, quote! { self.#ident }),
         Type::TYPE_MESSAGE | Type::TYPE_GROUP => {
-            let owned_path = resolve_owned_path(ctx, field, current_package, struct_nesting)?;
+            let owned_path = resolve_owned_path(ctx, field, current_package, 0)?;
             // Use rust_path_to_tokens, not syn::parse_str: the latter chokes
             // on keyword segments like `super::super::type::LatLng`.
             let owned_ty = crate::message::rust_path_to_tokens(&owned_path);
-            quote! {
-                match self.#ident.as_option() {
-                    Some(v) => ::buffa::MessageField::<#owned_ty>::some(v.to_owned_message()),
-                    None => ::buffa::MessageField::none(),
+            if message_field_view_skipped(field, view_skip_fqns) {
+                quote! {
+                    match self.#ident.as_option() {
+                        Some(v) => ::buffa::MessageField::<#owned_ty>::some(v.clone()),
+                        None => ::buffa::MessageField::none(),
+                    }
+                }
+            } else {
+                quote! {
+                    match self.#ident.as_option() {
+                        Some(v) => ::buffa::MessageField::<#owned_ty>::some(v.to_owned_message()),
+                        None => ::buffa::MessageField::none(),
+                    }
                 }
             }
         }
@@ -1384,10 +1656,12 @@ fn singular_to_owned(
 
 fn repeated_to_owned(
     ctx: &CodeGenContext,
+    field: &FieldDescriptorProto,
     ty: Type,
     ident: &proc_macro2::Ident,
     proto_fqn: &str,
     field_name: &str,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     Ok(match ty {
         Type::TYPE_STRING => quote! { self.#ident.iter().map(|s| s.to_string()).collect() },
@@ -1397,13 +1671,16 @@ fn repeated_to_owned(
             quote! { self.#ident.iter().map(|b| #conv).collect() }
         }
         Type::TYPE_MESSAGE | Type::TYPE_GROUP => {
-            quote! { self.#ident.iter().map(|v| v.to_owned_message()).collect() }
+            if message_field_view_skipped(field, view_skip_fqns) {
+                quote! { self.#ident.iter().map(|v| v.clone()).collect() }
+            } else {
+                quote! { self.#ident.iter().map(|v| v.to_owned_message()).collect() }
+            }
         }
         _ => quote! { self.#ident.to_vec() },
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn map_to_owned_expr(
     ctx: &CodeGenContext,
     msg: &DescriptorProto,
@@ -1411,7 +1688,7 @@ fn map_to_owned_expr(
     ident: &proc_macro2::Ident,
     current_package: &str,
     features: &ResolvedFeatures,
-    struct_nesting: usize,
+    view_skip_fqns: &HashSet<String>,
 ) -> Result<TokenStream, CodeGenError> {
     let (key_fd, val_fd) = find_map_entry_fields(msg, field)?;
 
@@ -1427,8 +1704,12 @@ fn map_to_owned_expr(
         Type::TYPE_BYTES => quote! { v.to_vec() },
         Type::TYPE_MESSAGE => {
             // Verify the owned path resolves (catches missing imports at codegen time).
-            let _owned_path = resolve_owned_path(ctx, val_fd, current_package, struct_nesting)?;
-            quote! { v.to_owned_message() }
+            let _owned_path = resolve_owned_path(ctx, val_fd, current_package, 0)?;
+            if message_field_view_skipped(val_fd, view_skip_fqns) {
+                quote! { v.clone() }
+            } else {
+                quote! { v.to_owned_message() }
+            }
         }
         _ => quote! { *v },
     };
@@ -1443,13 +1724,19 @@ fn oneof_variant_to_owned(
     ty: Type,
     proto_fqn: &str,
     field_name: &str,
+    field: &FieldDescriptorProto,
+    view_skip_fqns: &HashSet<String>,
 ) -> TokenStream {
     match ty {
         Type::TYPE_STRING => quote! { v.to_string() },
         // match-ergonomics on &ViewEnum → v: &&[u8]. bytes_to_owned handles it.
         Type::TYPE_BYTES => bytes_to_owned(ctx, proto_fqn, field_name, quote! { v }),
         Type::TYPE_MESSAGE | Type::TYPE_GROUP => {
-            quote! { ::buffa::alloc::boxed::Box::new(v.to_owned_message()) }
+            if message_field_view_skipped(field, view_skip_fqns) {
+                quote! { ::buffa::alloc::boxed::Box::new(v.as_ref().clone()) }
+            } else {
+                quote! { ::buffa::alloc::boxed::Box::new(v.to_owned_message()) }
+            }
         }
         _ => quote! { *v },
     }

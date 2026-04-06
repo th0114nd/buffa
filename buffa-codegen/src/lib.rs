@@ -591,7 +591,7 @@ fn generate_file(
                 top_level_name,
                 &proto_fqn,
                 &features,
-                0,
+                &view_skip_fqns,
             )?;
             tokens.extend(view_top);
             view_mod
