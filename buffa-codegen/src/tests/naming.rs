@@ -656,6 +656,118 @@ fn test_top_level_message_named_option_qualifies_option() {
 }
 
 #[test]
+fn test_sibling_proto_option_shadows_prelude_across_generated_files() {
+    // Two `.proto` files in the same package, `include!`d into one Rust module:
+    // a top-level `message Option` in one file emits `pub struct Option` at
+    // the shared module root, shadowing `core::option::Option` for siblings.
+    let mut defs = proto3_file("defs.proto");
+    defs.package = Some("pkg".to_string());
+    defs.message_type = vec![DescriptorProto {
+        name: Some("Option".to_string()),
+        ..Default::default()
+    }];
+
+    let mut user = proto3_file("user.proto");
+    user.package = Some("pkg".to_string());
+    user.message_type = vec![DescriptorProto {
+        name: Some("Holder".to_string()),
+        field: vec![{
+            let mut f = make_field("value", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+            f.proto3_optional = Some(true);
+            f.oneof_index = Some(0);
+            f
+        }],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("_value".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+
+    let fds = vec![defs, user];
+    let config = CodeGenConfig {
+        generate_views: false,
+        ..Default::default()
+    };
+    let result = generate(
+        &fds,
+        &["defs.proto".to_string(), "user.proto".to_string()],
+        &config,
+    );
+    let files = result.expect("cross-file Option shadow should resolve");
+    let user_rs = files
+        .iter()
+        .find(|f| f.name == "user.rs")
+        .expect("user.rs output");
+    assert!(
+        user_rs.content.contains("::core::option::Option<"),
+        "Holder must use qualified Option when sibling defs.proto defines message Option: {}",
+        user_rs.content
+    );
+    assert!(
+        !user_rs.content.contains("pub value: Option<"),
+        "bare Option<> on Holder would resolve to the proto struct: {}",
+        user_rs.content
+    );
+}
+
+#[test]
+fn test_option_message_in_other_package_does_not_qualify_prelude() {
+    // Same `generate()` batch, different protobuf packages → different Rust
+    // module roots; `message Option` in pkg.a must not force `::core::option::Option`
+    // in pkg.b.
+    let mut defs = proto3_file("defs.proto");
+    defs.package = Some("pkg.a".to_string());
+    defs.message_type = vec![DescriptorProto {
+        name: Some("Option".to_string()),
+        ..Default::default()
+    }];
+
+    let mut user = proto3_file("user.proto");
+    user.package = Some("pkg.b".to_string());
+    user.message_type = vec![DescriptorProto {
+        name: Some("Holder".to_string()),
+        field: vec![{
+            let mut f = make_field("value", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+            f.proto3_optional = Some(true);
+            f.oneof_index = Some(0);
+            f
+        }],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("_value".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+
+    let fds = vec![defs, user];
+    let config = CodeGenConfig {
+        generate_views: false,
+        ..Default::default()
+    };
+    let result = generate(
+        &fds,
+        &["defs.proto".to_string(), "user.proto".to_string()],
+        &config,
+    );
+    let files = result.expect("cross-package batch should generate");
+    let user_rs = files
+        .iter()
+        .find(|f| f.name == "user.rs")
+        .expect("user.rs output");
+    assert!(
+        !user_rs.content.contains("::core::option::Option<"),
+        "pkg.b should keep bare prelude Option when pkg.a defines message Option: {}",
+        user_rs.content
+    );
+    assert!(
+        user_rs.content.contains("Option<"),
+        "expected standard optional wrapper in Holder: {}",
+        user_rs.content
+    );
+}
+
+#[test]
 fn test_message_named_type_with_nested() {
     // Proto message named "Type" (a Rust keyword) with a nested message.
     // This must produce valid Rust: `pub mod r#type { ... }`.

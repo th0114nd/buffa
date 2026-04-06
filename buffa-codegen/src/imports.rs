@@ -12,7 +12,7 @@
 //! Buffa runtime types are always emitted as absolute paths since generated
 //! files may be combined via `include!`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::generated::descriptor::{DescriptorProto, FileDescriptorProto};
 use proc_macro2::TokenStream;
@@ -40,6 +40,50 @@ fn check_names_for_prelude_collisions<'a>(
     blocked
 }
 
+/// Top-level message and enum names in `file` that shadow prelude types
+/// (`Option`, etc.).
+///
+/// Nested types are omitted: they are emitted inside `pub mod` scopes and do
+/// not occupy the module root when a `.proto` is generated to its own `.rs`
+/// file.
+fn top_level_prelude_blocked_names(file: &FileDescriptorProto) -> HashSet<String> {
+    let names = file
+        .message_type
+        .iter()
+        .filter_map(|m| m.name.as_deref())
+        .chain(file.enum_type.iter().filter_map(|e| e.name.as_deref()));
+    check_names_for_prelude_collisions(names)
+}
+
+/// Per-protobuf-package union of [`top_level_prelude_blocked_names`] over
+/// every path in `files_to_generate` that belongs to that package.
+///
+/// Generated Rust for one package is typically `include!`d under one `pub mod`,
+/// so a top-level `message Option` in file A is a sibling `pub struct Option`
+/// at that module root and shadows `core::option::Option` for every other
+/// generated file in the **same** package. Files in other packages live under
+/// different modules and are not affected.
+pub(crate) fn compilation_prelude_blocked_by_package(
+    file_descriptors: &[FileDescriptorProto],
+    files_to_generate: &[String],
+) -> HashMap<String, HashSet<String>> {
+    let mut by_package: HashMap<String, HashSet<String>> = HashMap::new();
+    for file_name in files_to_generate {
+        let Some(file) = file_descriptors
+            .iter()
+            .find(|f| f.name.as_deref() == Some(file_name.as_str()))
+        else {
+            continue;
+        };
+        let pkg = file.package.clone().unwrap_or_default();
+        by_package
+            .entry(pkg)
+            .or_default()
+            .extend(top_level_prelude_blocked_names(file));
+    }
+    by_package
+}
+
 /// Tracks which short names are safe to use in a generated scope.
 pub(crate) struct ImportResolver {
     /// Proto type names that collide with prelude names.
@@ -47,16 +91,12 @@ pub(crate) struct ImportResolver {
 }
 
 impl ImportResolver {
-    /// Build a resolver for a single `.proto` file by checking top-level
-    /// message and enum names against the set of short names we want to use.
-    pub fn for_file(file: &FileDescriptorProto) -> Self {
-        let names = file
-            .message_type
-            .iter()
-            .filter_map(|m| m.name.as_deref())
-            .chain(file.enum_type.iter().filter_map(|e| e.name.as_deref()));
+    /// Resolver for one output file when generating a batch: `blocked` is the
+    /// per-package union of prelude collisions for the file's protobuf package
+    /// (see [`compilation_prelude_blocked_by_package`]).
+    pub(crate) fn from_compilation_blocked(blocked: &HashSet<String>) -> Self {
         Self {
-            blocked: check_names_for_prelude_collisions(names),
+            blocked: blocked.clone(),
         }
     }
 

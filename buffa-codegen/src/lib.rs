@@ -211,6 +211,8 @@ pub fn generate(
     config: &CodeGenConfig,
 ) -> Result<Vec<GeneratedFile>, CodeGenError> {
     let ctx = context::CodeGenContext::for_generate(file_descriptors, files_to_generate, config);
+    let prelude_blocked_by_package =
+        imports::compilation_prelude_blocked_by_package(file_descriptors, files_to_generate);
 
     let mut output = Vec::new();
     for file_name in files_to_generate {
@@ -219,7 +221,12 @@ pub fn generate(
             .find(|f| f.name.as_deref() == Some(file_name.as_str()))
             .ok_or_else(|| CodeGenError::FileNotFound(file_name.clone()))?;
 
-        let content = generate_file(&ctx, file_desc)?;
+        let pkg_key = file_desc.package.clone().unwrap_or_default();
+        let compilation_blocked = prelude_blocked_by_package
+            .get(&pkg_key)
+            .cloned()
+            .unwrap_or_default();
+        let content = generate_file(&ctx, file_desc, &compilation_blocked)?;
         let rust_filename = proto_path_to_rust_module(file_name);
         output.push(GeneratedFile {
             name: rust_filename,
@@ -440,6 +447,7 @@ fn collect_view_skip_fqns(file: &FileDescriptorProto) -> std::collections::HashS
 fn generate_file(
     ctx: &context::CodeGenContext,
     file: &FileDescriptorProto,
+    compilation_blocked: &std::collections::HashSet<String>,
 ) -> Result<String, CodeGenError> {
     // Validate descriptors before generating code.
     check_reserved_field_names(file)?;
@@ -450,7 +458,7 @@ fn generate_file(
         std::collections::HashSet::new()
     };
 
-    let resolver = imports::ImportResolver::for_file(file);
+    let resolver = imports::ImportResolver::from_compilation_blocked(compilation_blocked);
     let mut tokens = resolver.generate_use_block();
     let current_package = file.package.as_deref().unwrap_or("");
     let features = crate::features::for_file(file);
