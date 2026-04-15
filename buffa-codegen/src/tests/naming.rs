@@ -217,10 +217,7 @@ fn test_nested_enum_oneof_conflict_resolved_with_suffix() {
         name: Some("PerkRestrictions".to_string()),
         enum_type: vec![EnumDescriptorProto {
             name: Some("RegionCodes".to_string()),
-            value: vec![
-                enum_value("REGION_CODES_UNKNOWN", 0),
-                enum_value("US", 1),
-            ],
+            value: vec![enum_value("REGION_CODES_UNKNOWN", 0), enum_value("US", 1)],
             ..Default::default()
         }],
         oneof_decl: vec![OneofDescriptorProto {
@@ -285,6 +282,168 @@ fn test_nested_type_oneof_conflict_view_uses_suffix() {
         content.contains("MyFieldOneofView"),
         "view enum should use suffixed name: {content}"
     );
+}
+
+#[test]
+fn test_oneof_conflict_with_nested_view_struct_name() {
+    // When views are enabled, a sibling nested message named `MyFieldView`
+    // sits in the same module as the oneof view enum. The oneof resolver
+    // must reserve `{n}View` names so the enum gets `MyFieldOneofView`
+    // rather than shadowing the sibling's view struct.
+    let msg = DescriptorProto {
+        name: Some("Parent".to_string()),
+        nested_type: vec![DescriptorProto {
+            name: Some("MyFieldView".to_string()),
+            ..Default::default()
+        }],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("my_field".to_string()),
+            ..Default::default()
+        }],
+        field: vec![{
+            let mut f = make_field("val", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+            f.oneof_index = Some(0);
+            f
+        }],
+        ..Default::default()
+    };
+    let mut file = proto3_file("test.proto");
+    file.package = Some("pkg".to_string());
+    file.message_type = vec![msg];
+
+    let config = CodeGenConfig::default();
+    let files = generate(&[file], &["test.proto".to_string()], &config)
+        .expect("should rename to avoid nested view collision");
+    let content = &files[0].content;
+    // When views are on, owned and view names are allocated as a pair so
+    // neither side collides. The owned name would be `MyField` but then
+    // the view enum `MyFieldView` would shadow the nested message's
+    // struct of the same name, so the pair is suffixed together.
+    assert!(
+        content.contains("pub enum MyFieldOneof {"),
+        "owned oneof enum should be suffixed when view-form would collide: {content}"
+    );
+    assert!(
+        content.contains("pub enum MyFieldOneofView<"),
+        "view oneof enum should be suffixed in lockstep with the owned enum: {content}"
+    );
+    // And the nested message's own view struct must still be emitted
+    // unchanged at the name the user declared.
+    assert!(
+        content.contains("pub struct MyFieldView"),
+        "nested message view struct must be preserved: {content}"
+    );
+}
+
+#[test]
+fn test_sibling_oneof_view_names_do_not_collide() {
+    // Two sibling oneofs where the second's PascalCase owned name equals
+    // the first's view-form: the second must be renamed so its owned enum
+    // doesn't shadow the first oneof's view enum in the shared module.
+    let msg = DescriptorProto {
+        name: Some("Parent".to_string()),
+        oneof_decl: vec![
+            OneofDescriptorProto {
+                name: Some("my_field".to_string()),
+                ..Default::default()
+            },
+            OneofDescriptorProto {
+                name: Some("my_field_view".to_string()),
+                ..Default::default()
+            },
+        ],
+        field: vec![
+            {
+                let mut f = make_field("a", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+                f.oneof_index = Some(0);
+                f
+            },
+            {
+                let mut f = make_field("b", 2, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+                f.oneof_index = Some(1);
+                f
+            },
+        ],
+        ..Default::default()
+    };
+    let mut file = proto3_file("test.proto");
+    file.package = Some("pkg".to_string());
+    file.message_type = vec![msg];
+
+    let files = generate(
+        &[file],
+        &["test.proto".to_string()],
+        &CodeGenConfig::default(),
+    )
+    .expect("sibling oneof names must resolve without collision");
+    let content = &files[0].content;
+    // First oneof owned/view: MyField / MyFieldView.
+    assert!(
+        content.contains("pub enum MyField {"),
+        "first oneof owned enum should be MyField: {content}"
+    );
+    assert!(
+        content.contains("pub enum MyFieldView<"),
+        "first oneof view enum should be MyFieldView<'a>: {content}"
+    );
+    // Second oneof's pascal-case name would be MyFieldView, which clashes
+    // with the first oneof's view enum — it must take the Oneof suffix.
+    assert!(
+        content.contains("pub enum MyFieldViewOneof {"),
+        "second oneof owned enum should be MyFieldViewOneof: {content}"
+    );
+    assert!(
+        content.contains("pub enum MyFieldViewOneofView<"),
+        "second oneof view enum should be MyFieldViewOneofView<'a>: {content}"
+    );
+}
+
+#[test]
+fn test_oneof_suffix_conflict_error_includes_scope() {
+    // Verify the diagnostic carries the parent message's FQN so users can
+    // locate which message triggered the error in a large descriptor set.
+    let msg = DescriptorProto {
+        name: Some("Parent".to_string()),
+        nested_type: vec![
+            DescriptorProto {
+                name: Some("MyField".to_string()),
+                ..Default::default()
+            },
+            DescriptorProto {
+                name: Some("MyFieldOneof".to_string()),
+                ..Default::default()
+            },
+        ],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("my_field".to_string()),
+            ..Default::default()
+        }],
+        field: vec![{
+            let mut f = make_field("val", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+            f.oneof_index = Some(0);
+            f
+        }],
+        ..Default::default()
+    };
+    let mut file = proto3_file("test.proto");
+    file.package = Some("pkg".to_string());
+    file.message_type = vec![msg];
+
+    let err = generate(
+        &[file],
+        &["test.proto".to_string()],
+        &CodeGenConfig::default(),
+    )
+    .expect_err("double collision must error");
+    match err {
+        CodeGenError::OneofSuffixConflict {
+            scope, oneof_name, ..
+        } => {
+            assert_eq!(scope, "pkg.Parent");
+            assert_eq!(oneof_name, "my_field");
+        }
+        other => panic!("expected OneofSuffixConflict, got {other:?}"),
+    }
 }
 
 #[test]

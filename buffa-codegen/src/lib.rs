@@ -649,10 +649,12 @@ pub enum CodeGenError {
     /// The `Oneof`-suffixed name chosen to disambiguate a oneof enum from a
     /// nested type also collides with another nested type.
     #[error(
-        "oneof '{oneof_name}' collides with a nested type, and the fallback \
-         name '{attempted}' also collides with another nested type"
+        "name conflict in '{scope}': oneof '{oneof_name}' collides with a \
+         nested type, and the fallback name '{attempted}' also collides \
+         with another name in the enclosing scope"
     )]
     OneofSuffixConflict {
+        scope: String,
         oneof_name: String,
         attempted: String,
     },

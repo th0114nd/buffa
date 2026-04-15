@@ -458,18 +458,84 @@ pub(crate) fn oneof_variant_deser_arm(input: &OneofVariantDeserInput<'_>) -> Tok
     }
 }
 
-/// Collect names that oneof enums must not collide with inside a message
-/// module: nested message names and nested enum names.
-pub(crate) fn reserved_names_for_msg(msg: &DescriptorProto) -> std::collections::HashSet<String> {
-    let mut reserved = std::collections::HashSet::new();
+/// Reserved-name sets shared between the owned-side oneof enum (`pub enum
+/// MyField`) and its view counterpart (`pub enum MyFieldView<'a>`) inside
+/// the same message module. Both the chosen owned name AND its `+"View"`
+/// form must be unique in the module, since owned and view types are
+/// emitted side by side.
+struct ReservedNames {
+    /// Names of every nested type (messages and enums) that the owned
+    /// oneof enum would collide with.
+    owned: std::collections::HashSet<String>,
+    /// Names that `{owned}+"View"` would collide with when view generation
+    /// is enabled. Initialized from nested message owned names; grown as
+    /// each oneof owned ident is allocated so later oneofs don't claim
+    /// the same view name.
+    view: std::collections::HashSet<String>,
+    /// Whether view codegen is on and therefore view collisions matter.
+    views_enabled: bool,
+}
+
+impl ReservedNames {
+    /// Reserve a newly-allocated owned oneof name. When views are enabled
+    /// we additionally reserve its view-form so a later oneof in the same
+    /// message can't claim the same view enum.
+    fn insert_owned(&mut self, name: String) {
+        if self.views_enabled {
+            self.view.insert(format!("{name}View"));
+        }
+        self.owned.insert(name);
+    }
+
+    /// True if `candidate` would collide with any other name in the
+    /// message module. Owned types and view types share a single Rust
+    /// module, so both directions must be checked when views are enabled:
+    /// (a) `candidate` itself against the owned set, (b) `candidate` itself
+    /// against the view set (a prior oneof's view enum may already claim
+    /// this name), and (c) the derived `{candidate}View` against the view
+    /// set (a sibling nested message with the same name would collide
+    /// with the view enum we are about to emit).
+    fn collides(&self, candidate: &str) -> bool {
+        if self.owned.contains(candidate) {
+            return true;
+        }
+        if self.views_enabled {
+            if self.view.contains(candidate) {
+                return true;
+            }
+            let view_form = format!("{candidate}View");
+            if self.view.contains(&view_form) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Collect names that a oneof enum must not collide with inside a message
+/// module. Returns both the owned-side reserved set (nested message and
+/// nested enum names) and, when view generation is enabled, the set that
+/// the derived `{name}+"View"` form must also steer clear of: nested
+/// message names themselves, since e.g. a oneof named `my_field` compiled
+/// to owned `MyField` would produce view enum `MyFieldView` and clash with
+/// a sibling nested message named `MyFieldView`.
+fn reserved_names_for_msg(msg: &DescriptorProto, generate_views: bool) -> ReservedNames {
+    let mut reserved = ReservedNames {
+        owned: std::collections::HashSet::new(),
+        view: std::collections::HashSet::new(),
+        views_enabled: generate_views,
+    };
     for nested in &msg.nested_type {
         if let Some(name) = &nested.name {
-            reserved.insert(name.clone());
+            reserved.owned.insert(name.clone());
+            if generate_views {
+                reserved.view.insert(name.clone());
+            }
         }
     }
     for nested_enum in &msg.enum_type {
         if let Some(name) = &nested_enum.name {
-            reserved.insert(name.clone());
+            reserved.owned.insert(name.clone());
         }
     }
     reserved
@@ -481,19 +547,26 @@ pub(crate) fn reserved_names_for_msg(msg: &DescriptorProto) -> std::collections:
 /// module (`pub mod msg_name { pub enum OneofField { ... } }`), so no
 /// message prefix is needed.
 ///
-/// When the PascalCase name collides with a name in `reserved` (e.g.
-/// nested message or enum names that share the same module), the suffix
-/// `Oneof` is appended to disambiguate. Returns an error if the suffixed
-/// name also collides.
-pub(crate) fn oneof_enum_ident(
+/// When the PascalCase name collides with any name in `reserved` (either
+/// the owned-side set or, when views are enabled, the view-side check on
+/// `{name}View`), the suffix `Oneof` is appended to disambiguate. Returns
+/// an error if the suffixed name also collides.
+///
+/// # Errors
+///
+/// Returns [`CodeGenError::OneofSuffixConflict`] when both `{Pascal}` and
+/// `{Pascal}Oneof` collide with a reserved name.
+fn oneof_enum_ident(
     oneof_name: &str,
-    reserved: &std::collections::HashSet<String>,
+    reserved: &ReservedNames,
+    scope: &str,
 ) -> Result<proc_macro2::Ident, CodeGenError> {
     let pascal = to_pascal_case(oneof_name);
-    if reserved.contains(&pascal) {
+    if reserved.collides(&pascal) {
         let suffixed = format!("{}Oneof", pascal);
-        if reserved.contains(&suffixed) {
+        if reserved.collides(&suffixed) {
             return Err(CodeGenError::OneofSuffixConflict {
+                scope: scope.to_string(),
                 oneof_name: oneof_name.to_string(),
                 attempted: suffixed,
             });
@@ -511,12 +584,24 @@ pub(crate) fn oneof_enum_ident(
 /// suffixed names (e.g. `my_field` → `MyFieldOneof` reserves that name
 /// so `my_field_oneof` cannot also claim `MyFieldOneof`).
 ///
+/// `scope` is the parent message's fully-qualified proto name, used only
+/// in error diagnostics. `generate_views` must match
+/// [`CodeGenContext::config.generate_views`](crate::context::CodeGenContext);
+/// when true, `{n}View` names are added to the reserved set.
+///
 /// Returns a map from oneof declaration index to its Rust enum `Ident`.
 /// Synthetic oneofs (proto3 `optional`) are omitted.
+///
+/// # Errors
+///
+/// Propagates [`CodeGenError::OneofSuffixConflict`] from
+/// [`oneof_enum_ident`].
 pub(crate) fn resolve_oneof_idents(
     msg: &DescriptorProto,
+    scope: &str,
+    generate_views: bool,
 ) -> Result<std::collections::HashMap<usize, Ident>, CodeGenError> {
-    let mut reserved = reserved_names_for_msg(msg);
+    let mut reserved = reserved_names_for_msg(msg, generate_views);
     let mut result = std::collections::HashMap::new();
     for (idx, oneof) in msg.oneof_decl.iter().enumerate() {
         let has_real_fields = msg.field.iter().any(|f| {
@@ -526,8 +611,8 @@ pub(crate) fn resolve_oneof_idents(
             continue;
         }
         if let Some(oneof_name) = &oneof.name {
-            let ident = oneof_enum_ident(oneof_name, &reserved)?;
-            reserved.insert(ident.to_string());
+            let ident = oneof_enum_ident(oneof_name, &reserved, scope)?;
+            reserved.insert_owned(ident.to_string());
             result.insert(idx, ident);
         }
     }

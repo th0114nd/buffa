@@ -146,7 +146,8 @@ pub fn generate_message(
     // Compute oneof enum identifiers for all non-synthetic oneofs up front.
     // Sequential allocation prevents sibling oneofs from claiming the same
     // suffixed name (see `resolve_oneof_idents`).
-    let oneof_idents = crate::oneof::resolve_oneof_idents(msg)?;
+    let oneof_idents =
+        crate::oneof::resolve_oneof_idents(msg, proto_fqn, ctx.config.generate_views)?;
 
     // One `Option<OneofEnum>` field in the struct per non-synthetic oneof.
     // Oneof enums live inside the message's module, so the type path is
