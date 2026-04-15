@@ -646,14 +646,17 @@ pub enum CodeGenError {
         name_b: String,
         module_name: String,
     },
-    /// The `Oneof`-suffixed name chosen to disambiguate a oneof enum from a
-    /// nested type also collides with another nested type.
+    /// The `{Name}Oneof` identifier buffa would emit for a oneof collides
+    /// with another name in the parent message's Rust module (a nested
+    /// message, a nested enum, or — when view generation is enabled — a
+    /// `{Name}OneofView`-equivalent sibling). Resolve by renaming the
+    /// oneof or the colliding nested type in the `.proto`.
     #[error(
-        "name conflict in '{scope}': oneof '{oneof_name}' collides with a \
-         nested type, and the fallback name '{attempted}' also collides \
-         with another name in the enclosing scope"
+        "name conflict in '{scope}': oneof '{oneof_name}' would emit as \
+         '{attempted}', but that name already names another item in the \
+         enclosing scope"
     )]
-    OneofSuffixConflict {
+    OneofNameConflict {
         scope: String,
         oneof_name: String,
         attempted: String,

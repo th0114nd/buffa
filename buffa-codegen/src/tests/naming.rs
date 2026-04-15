@@ -140,9 +140,10 @@ fn test_different_snake_case_names_no_conflict() {
 }
 
 #[test]
-fn test_nested_type_oneof_conflict_resolved_with_suffix() {
-    // Nested message "MyField" and oneof "my_field" both produce MyField in
-    // PascalCase.  The oneof enum should be renamed to MyFieldOneof.
+fn test_nested_type_oneof_coexists_with_suffix() {
+    // Nested message "MyField" and oneof "my_field" coexist: the oneof
+    // enum is always named "MyFieldOneof" under the uniform-suffix rule,
+    // which happens to be collision-free against the nested struct.
     let msg = DescriptorProto {
         name: Some("Parent".to_string()),
         nested_type: vec![DescriptorProto {
@@ -181,7 +182,8 @@ fn test_nested_type_oneof_conflict_resolved_with_suffix() {
 
 #[test]
 fn test_nested_type_oneof_no_conflict() {
-    // Nested message "Inner" and oneof "my_field" produce different names.
+    // Nested message "Inner" and oneof "my_field" — the oneof enum is
+    // "MyFieldOneof" so neither side collides regardless.
     let msg = DescriptorProto {
         name: Some("Parent".to_string()),
         nested_type: vec![DescriptorProto {
@@ -209,10 +211,10 @@ fn test_nested_type_oneof_no_conflict() {
 }
 
 #[test]
-fn test_nested_enum_oneof_conflict_resolved_with_suffix() {
-    // Nested enum "RegionCodes" and oneof "region_codes" both produce
-    // RegionCodes in PascalCase.  The oneof enum should become
-    // RegionCodesOneof (the original gh#31 example).
+fn test_nested_enum_oneof_coexists_with_suffix() {
+    // Nested enum "RegionCodes" and oneof "region_codes": the oneof enum
+    // is always "RegionCodesOneof" under the uniform rule; this is the
+    // gh#31 motivating example.
     let msg = DescriptorProto {
         name: Some("PerkRestrictions".to_string()),
         enum_type: vec![EnumDescriptorProto {
@@ -250,9 +252,9 @@ fn test_nested_enum_oneof_conflict_resolved_with_suffix() {
 }
 
 #[test]
-fn test_nested_type_oneof_conflict_view_uses_suffix() {
-    // When view generation is on, the view enum should also use the
-    // Oneof-suffixed name (MyFieldOneofView).
+fn test_nested_type_oneof_view_uses_suffix() {
+    // When view generation is on, the view enum uses the uniform
+    // suffixed name (MyFieldOneofView) alongside its owned counterpart.
     let msg = DescriptorProto {
         name: Some("Parent".to_string()),
         nested_type: vec![DescriptorProto {
@@ -285,11 +287,11 @@ fn test_nested_type_oneof_conflict_view_uses_suffix() {
 }
 
 #[test]
-fn test_oneof_conflict_with_nested_view_struct_name() {
-    // When views are enabled, a sibling nested message named `MyFieldView`
-    // sits in the same module as the oneof view enum. The oneof resolver
-    // must reserve `{n}View` names so the enum gets `MyFieldOneofView`
-    // rather than shadowing the sibling's view struct.
+fn test_oneof_coexists_with_nested_view_struct_name() {
+    // Nested message `MyFieldView` + oneof `my_field` with views enabled:
+    // under the uniform-suffix rule the oneof enum is `MyFieldOneof` and
+    // its view is `MyFieldOneofView`; neither name collides with the
+    // nested message's view struct (also `MyFieldView`).
     let msg = DescriptorProto {
         name: Some("Parent".to_string()),
         nested_type: vec![DescriptorProto {
@@ -313,22 +315,17 @@ fn test_oneof_conflict_with_nested_view_struct_name() {
 
     let config = CodeGenConfig::default();
     let files = generate(&[file], &["test.proto".to_string()], &config)
-        .expect("should rename to avoid nested view collision");
+        .expect("uniform suffix keeps the oneof clear of nested view name");
     let content = &files[0].content;
-    // When views are on, owned and view names are allocated as a pair so
-    // neither side collides. The owned name would be `MyField` but then
-    // the view enum `MyFieldView` would shadow the nested message's
-    // struct of the same name, so the pair is suffixed together.
     assert!(
         content.contains("pub enum MyFieldOneof {"),
-        "owned oneof enum should be suffixed when view-form would collide: {content}"
+        "owned oneof enum should be MyFieldOneof: {content}"
     );
     assert!(
         content.contains("pub enum MyFieldOneofView<"),
-        "view oneof enum should be suffixed in lockstep with the owned enum: {content}"
+        "view oneof enum should be MyFieldOneofView<'a>: {content}"
     );
-    // And the nested message's own view struct must still be emitted
-    // unchanged at the name the user declared.
+    // The nested message's own view struct remains unchanged.
     assert!(
         content.contains("pub struct MyFieldView"),
         "nested message view struct must be preserved: {content}"
@@ -337,9 +334,10 @@ fn test_oneof_conflict_with_nested_view_struct_name() {
 
 #[test]
 fn test_sibling_oneof_view_names_do_not_collide() {
-    // Two sibling oneofs where the second's PascalCase owned name equals
-    // the first's view-form: the second must be renamed so its owned enum
-    // doesn't shadow the first oneof's view enum in the shared module.
+    // Two sibling oneofs `my_field` and `my_field_view`. Under the
+    // uniform-suffix rule they become `MyFieldOneof`/`MyFieldOneofView`
+    // and `MyFieldViewOneof`/`MyFieldViewOneofView` — never collide with
+    // each other or with their own view counterparts.
     let msg = DescriptorProto {
         name: Some("Parent".to_string()),
         oneof_decl: vec![
@@ -377,17 +375,14 @@ fn test_sibling_oneof_view_names_do_not_collide() {
     )
     .expect("sibling oneof names must resolve without collision");
     let content = &files[0].content;
-    // First oneof owned/view: MyField / MyFieldView.
     assert!(
-        content.contains("pub enum MyField {"),
-        "first oneof owned enum should be MyField: {content}"
+        content.contains("pub enum MyFieldOneof {"),
+        "first oneof owned enum should be MyFieldOneof: {content}"
     );
     assert!(
-        content.contains("pub enum MyFieldView<"),
-        "first oneof view enum should be MyFieldView<'a>: {content}"
+        content.contains("pub enum MyFieldOneofView<"),
+        "first oneof view enum should be MyFieldOneofView<'a>: {content}"
     );
-    // Second oneof's pascal-case name would be MyFieldView, which clashes
-    // with the first oneof's view enum — it must take the Oneof suffix.
     assert!(
         content.contains("pub enum MyFieldViewOneof {"),
         "second oneof owned enum should be MyFieldViewOneof: {content}"
@@ -436,32 +431,30 @@ fn test_oneof_suffix_conflict_error_includes_scope() {
     )
     .expect_err("double collision must error");
     match err {
-        CodeGenError::OneofSuffixConflict {
-            scope, oneof_name, ..
+        CodeGenError::OneofNameConflict {
+            scope,
+            oneof_name,
+            attempted,
         } => {
             assert_eq!(scope, "pkg.Parent");
             assert_eq!(oneof_name, "my_field");
+            assert_eq!(attempted, "MyFieldOneof");
         }
-        other => panic!("expected OneofSuffixConflict, got {other:?}"),
+        other => panic!("expected OneofNameConflict, got {other:?}"),
     }
 }
 
 #[test]
-fn test_oneof_suffix_double_collision_errors() {
-    // Nested types "MyField" and "MyFieldOneof" plus oneof "my_field" —
-    // the suffix fallback also collides, so this must error.
+fn test_oneof_name_conflict_errors() {
+    // A nested type literally named "MyFieldOneof" alongside oneof
+    // "my_field" leaves the uniform-suffix name with nowhere to go —
+    // users must rename one side in the `.proto`.
     let msg = DescriptorProto {
         name: Some("Parent".to_string()),
-        nested_type: vec![
-            DescriptorProto {
-                name: Some("MyField".to_string()),
-                ..Default::default()
-            },
-            DescriptorProto {
-                name: Some("MyFieldOneof".to_string()),
-                ..Default::default()
-            },
-        ],
+        nested_type: vec![DescriptorProto {
+            name: Some("MyFieldOneof".to_string()),
+            ..Default::default()
+        }],
         oneof_decl: vec![OneofDescriptorProto {
             name: Some("my_field".to_string()),
             ..Default::default()
@@ -489,15 +482,11 @@ fn test_oneof_suffix_double_collision_errors() {
 
 #[test]
 fn test_sibling_oneofs_get_distinct_names() {
-    // nested message "MyField", oneof "my_field" → MyFieldOneof,
-    // oneof "my_field_oneof" → would naturally be MyFieldOneof too.
-    // Sequential allocation must assign distinct names.
+    // Two oneofs `my_field` and `my_field_oneof` — both want
+    // `MyFieldOneof` as their Rust name. Sequential allocation must
+    // assign distinct names, e.g. `MyFieldOneof` and `MyFieldOneofOneof`.
     let msg = DescriptorProto {
         name: Some("Parent".to_string()),
-        nested_type: vec![DescriptorProto {
-            name: Some("MyField".to_string()),
-            ..Default::default()
-        }],
         oneof_decl: vec![
             OneofDescriptorProto {
                 name: Some("my_field".to_string()),
