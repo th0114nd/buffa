@@ -266,6 +266,116 @@ impl Config {
         self
     }
 
+    /// Add a custom attribute to generated types (messages and enums)
+    /// matching a proto path prefix.
+    ///
+    /// `path` is a fully-qualified proto path prefix: `"."` applies to all
+    /// types, `".my.pkg"` to types in that package, `".my.pkg.MyMessage"`
+    /// to a specific type. A leading `.` is auto-prepended if omitted; a
+    /// trailing `.` is trimmed. Prefix matching respects proto-segment
+    /// boundaries, so `".my.pk"` does not match `".my.pkg.Msg"`.
+    ///
+    /// `attribute` is a raw Rust attribute string
+    /// (e.g., `"#[derive(serde::Serialize)]"`). A malformed attribute
+    /// produces [`CodeGenError::InvalidCustomAttribute`](buffa_codegen::CodeGenError)
+    /// at compile time rather than being silently dropped.
+    ///
+    /// Multiple calls accumulate in insertion order — all matching attributes
+    /// are emitted, and ordering is preserved in generated code.
+    ///
+    /// Also applies to generated oneof enums when `path` matches
+    /// `".pkg.Msg.my_oneof"` (the oneof's fully-qualified path).
+    ///
+    /// # Pitfalls
+    ///
+    /// buffa already emits `#[derive(Clone, PartialEq)]` on messages and
+    /// `#[derive(Clone, PartialEq, Debug)]` on oneofs; adding a duplicate
+    /// derive via `type_attribute(".", "#[derive(Clone)]")` produces a
+    /// compile error in the generated code.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// buffa_build::Config::new()
+    ///     .type_attribute(".", "#[derive(serde::Serialize)]")
+    ///     .type_attribute(".my.pkg.MyEnum", "#[derive(strum::EnumIter)]")
+    ///     .files(&["proto/my_service.proto"])
+    ///     .includes(&["proto/"])
+    ///     .compile()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn type_attribute(mut self, path: impl Into<String>, attribute: impl Into<String>) -> Self {
+        self.codegen_config
+            .type_attributes
+            .push((normalize_attr_path(path.into()), attribute.into()));
+        self
+    }
+
+    /// Add a custom attribute to generated struct fields matching a proto
+    /// path prefix.
+    ///
+    /// `path` is a fully-qualified proto field path (e.g.,
+    /// `".my.pkg.MyMessage.my_field"`). `"."` applies to all fields. A
+    /// leading `.` is auto-prepended if omitted; a trailing `.` is trimmed.
+    /// Prefix matching respects proto-segment boundaries.
+    ///
+    /// Also applies to oneof variants when `path` matches
+    /// `".pkg.Msg.my_oneof.variant_name"`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// buffa_build::Config::new()
+    ///     .field_attribute(".my.pkg.MyMessage.secret_key", "#[serde(skip)]")
+    ///     .files(&["proto/my_service.proto"])
+    ///     .includes(&["proto/"])
+    ///     .compile()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn field_attribute(
+        mut self,
+        path: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        self.codegen_config
+            .field_attributes
+            .push((normalize_attr_path(path.into()), attribute.into()));
+        self
+    }
+
+    /// Add a custom attribute to generated message structs only (not enums,
+    /// not oneof enums) matching a proto path prefix.
+    ///
+    /// Same path-matching semantics as [`type_attribute`](Self::type_attribute) —
+    /// leading `.` auto-prepended, trailing `.` trimmed, proto-segment-aware
+    /// prefix matching, accumulation in insertion order. A malformed attribute
+    /// produces a compile-time error. Useful for struct-only attributes like
+    /// `#[serde(default)]`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// buffa_build::Config::new()
+    ///     .message_attribute(".", "#[serde(default)]")
+    ///     .files(&["proto/my_service.proto"])
+    ///     .includes(&["proto/"])
+    ///     .compile()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn message_attribute(
+        mut self,
+        path: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        self.codegen_config
+            .message_attributes
+            .push((normalize_attr_path(path.into()), attribute.into()));
+        self
+    }
+
     /// Use `buf build` instead of `protoc` for descriptor generation.
     ///
     /// `buf` is often easier to install and keep current than `protoc`
@@ -512,6 +622,24 @@ impl Default for Config {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Normalize a user-supplied attribute-match path.
+///
+/// - Prepends `.` if absent so all stored paths are rooted.
+/// - Trims trailing `.` so `".my.pkg."` and `".my.pkg"` behave identically
+///   (trailing-dot patterns otherwise never match a real FQN).
+/// - The bare catch-all `"."` is preserved as-is.
+fn normalize_attr_path(mut path: String) -> String {
+    if !path.starts_with('.') {
+        path.insert(0, '.');
+    }
+    if path.len() > 1 {
+        while path.ends_with('.') {
+            path.pop();
+        }
+    }
+    path
 }
 
 /// Write `content` to `path` only if the file doesn't already exist with
@@ -894,5 +1022,70 @@ mod tests {
 
         write_if_changed(&path, b"new").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn normalize_attr_path_prepends_leading_dot() {
+        assert_eq!(normalize_attr_path("my.pkg".into()), ".my.pkg");
+    }
+
+    #[test]
+    fn normalize_attr_path_preserves_leading_dot() {
+        assert_eq!(normalize_attr_path(".my.pkg".into()), ".my.pkg");
+    }
+
+    #[test]
+    fn normalize_attr_path_trims_trailing_dot() {
+        assert_eq!(normalize_attr_path("my.pkg.".into()), ".my.pkg");
+        assert_eq!(normalize_attr_path(".my.pkg.".into()), ".my.pkg");
+        assert_eq!(normalize_attr_path(".my.pkg...".into()), ".my.pkg");
+    }
+
+    #[test]
+    fn normalize_attr_path_preserves_catchall() {
+        assert_eq!(normalize_attr_path(".".into()), ".");
+        assert_eq!(normalize_attr_path("".into()), ".");
+    }
+
+    #[test]
+    fn type_attribute_forwards_normalized_path() {
+        let cfg = Config::new().type_attribute("my.pkg.", "#[derive(Foo)]");
+        assert_eq!(
+            cfg.codegen_config.type_attributes,
+            vec![(".my.pkg".to_string(), "#[derive(Foo)]".to_string())]
+        );
+    }
+
+    #[test]
+    fn field_attribute_forwards_normalized_path() {
+        let cfg = Config::new().field_attribute("pkg.Msg.f", "#[serde(skip)]");
+        assert_eq!(
+            cfg.codegen_config.field_attributes,
+            vec![(".pkg.Msg.f".to_string(), "#[serde(skip)]".to_string())]
+        );
+    }
+
+    #[test]
+    fn message_attribute_forwards_normalized_path() {
+        let cfg = Config::new().message_attribute(".", "#[serde(default)]");
+        assert_eq!(
+            cfg.codegen_config.message_attributes,
+            vec![(".".to_string(), "#[serde(default)]".to_string())]
+        );
+    }
+
+    #[test]
+    fn attribute_calls_accumulate_in_insertion_order() {
+        let cfg = Config::new()
+            .type_attribute(".", "#[derive(A)]")
+            .type_attribute(".pkg.M", "#[derive(B)]")
+            .type_attribute(".", "#[derive(C)]");
+        let paths: Vec<_> = cfg
+            .codegen_config
+            .type_attributes
+            .iter()
+            .map(|(_, a)| a.as_str())
+            .collect();
+        assert_eq!(paths, vec!["#[derive(A)]", "#[derive(B)]", "#[derive(C)]"]);
     }
 }

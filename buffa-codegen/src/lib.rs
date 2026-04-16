@@ -136,6 +136,26 @@ pub struct CodeGenConfig {
     /// `__*_TEXT_ANY` consts are still emitted; only the aggregating fn
     /// is suppressed.
     pub emit_register_fn: bool,
+    /// Custom attributes to inject on generated types (messages and enums).
+    ///
+    /// Each entry is `(proto_path, attribute)`. The `proto_path` is matched
+    /// as a prefix against the fully-qualified proto name: `"."` applies to
+    /// all types, `".my.pkg"` to types in that package, `".my.pkg.MyMessage"`
+    /// to a specific type. The `attribute` is a raw Rust attribute string
+    /// (e.g., `"#[derive(serde::Serialize)]"`).
+    pub type_attributes: Vec<(String, String)>,
+    /// Custom attributes to inject on generated struct fields.
+    ///
+    /// Each entry is `(proto_path, attribute)`. The `proto_path` is matched
+    /// as a prefix against the fully-qualified field path (e.g.,
+    /// `".my.pkg.MyMessage.my_field"`). `"."` applies to all fields.
+    pub field_attributes: Vec<(String, String)>,
+    /// Custom attributes to inject on generated message structs only (not enums).
+    ///
+    /// Same path-matching semantics as `type_attributes`, but only applied to
+    /// message structs, not enum types. Useful for struct-only attributes like
+    /// `#[serde(default)]`.
+    pub message_attributes: Vec<(String, String)>,
 }
 
 impl Default for CodeGenConfig {
@@ -151,6 +171,9 @@ impl Default for CodeGenConfig {
             allow_message_set: false,
             generate_text: false,
             emit_register_fn: true,
+            type_attributes: Vec::new(),
+            field_attributes: Vec::new(),
+            message_attributes: Vec::new(),
         }
     }
 }
@@ -680,6 +703,18 @@ pub enum CodeGenError {
          wire format — set allow_message_set(true) if this is intentional"
     )]
     MessageSetNotSupported { message_name: String },
+    /// A custom attribute string configured via [`CodeGenConfig::type_attributes`],
+    /// [`CodeGenConfig::field_attributes`], or [`CodeGenConfig::message_attributes`]
+    /// could not be parsed as a Rust attribute.
+    #[error(
+        "invalid custom attribute for path '{path}': '{attribute}' is not a valid \
+         Rust attribute ({detail})"
+    )]
+    InvalidCustomAttribute {
+        path: String,
+        attribute: String,
+        detail: String,
+    },
 }
 
 #[cfg(test)]
