@@ -217,10 +217,7 @@ fn test_nested_enum_oneof_conflict_resolved_with_suffix() {
         name: Some("PerkRestrictions".to_string()),
         enum_type: vec![EnumDescriptorProto {
             name: Some("RegionCodes".to_string()),
-            value: vec![
-                enum_value("REGION_CODES_UNKNOWN", 0),
-                enum_value("US", 1),
-            ],
+            value: vec![enum_value("REGION_CODES_UNKNOWN", 0), enum_value("US", 1)],
             ..Default::default()
         }],
         oneof_decl: vec![OneofDescriptorProto {
@@ -263,18 +260,21 @@ fn test_oneof_shadows_parent_message_name() {
             name: Some("data_type".to_string()),
             ..Default::default()
         }],
-        field: vec![
-            {
-                let mut f = make_field("variant", 1, Label::LABEL_OPTIONAL, Type::TYPE_MESSAGE);
-                f.type_name = Some(".pkg.DataType.Variant".to_string());
-                f.oneof_index = Some(0);
-                f
-            },
-        ],
+        field: vec![{
+            let mut f = make_field("variant", 1, Label::LABEL_OPTIONAL, Type::TYPE_MESSAGE);
+            f.type_name = Some(".pkg.DataType.Variant".to_string());
+            f.oneof_index = Some(0);
+            f
+        }],
         nested_type: vec![
             DescriptorProto {
                 name: Some("Variant".to_string()),
-                field: vec![make_field("name", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING)],
+                field: vec![make_field(
+                    "name",
+                    1,
+                    Label::LABEL_OPTIONAL,
+                    Type::TYPE_STRING,
+                )],
                 ..Default::default()
             },
             DescriptorProto {

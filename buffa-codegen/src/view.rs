@@ -109,13 +109,27 @@ pub fn generate_view(
         .iter()
         .enumerate()
         .map(|(idx, oneof)| {
-            generate_oneof_view_enum(ctx, msg, idx, oneof, current_package, features, &oneof_idents)
+            generate_oneof_view_enum(
+                ctx,
+                msg,
+                idx,
+                oneof,
+                current_package,
+                features,
+                &oneof_idents,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // decode_view match arms.
-    let (scalar_arms, repeated_arms, oneof_arms) =
-        build_decode_arms(ctx, msg, current_package, &mod_ident, features, &oneof_idents)?;
+    let (scalar_arms, repeated_arms, oneof_arms) = build_decode_arms(
+        ctx,
+        msg,
+        current_package,
+        &mod_ident,
+        features,
+        &oneof_idents,
+    )?;
 
     // to_owned_message field initialisers.
     let owned_fields = build_to_owned_fields(

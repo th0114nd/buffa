@@ -85,7 +85,10 @@ fn test_oneof_name_matching_parent_message() {
         ..core::default::Default::default()
     };
     let decoded = round_trip(&msg);
-    assert_eq!(decoded.status, Some(collisions::status::StatusOneof::Code(42)));
+    assert_eq!(
+        decoded.status,
+        Some(collisions::status::StatusOneof::Code(42))
+    );
 
     let msg2 = collisions::Status {
         status: Some(collisions::status::StatusOneof::Message("error".into())),
