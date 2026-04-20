@@ -27,9 +27,7 @@ use quote::quote;
 /// Those types are always emitted via `::buffa::alloc::*` re-exports.
 const PRELUDE_NAMES: &[&str] = &["Option"];
 
-fn check_names_for_prelude_collisions<'a>(
-    names: impl Iterator<Item = &'a str>,
-) -> HashSet<String> {
+fn check_names_for_prelude_collisions<'a>(names: impl Iterator<Item = &'a str>) -> HashSet<String> {
     let prelude: HashSet<&str> = PRELUDE_NAMES.iter().copied().collect();
     let mut blocked = HashSet::new();
     for name in names {

@@ -921,7 +921,8 @@ fn custom_deser_oneof_group(
     let field_ident = make_field_ident(oneof_name);
 
     // Oneof enum lives in the message's module.
-    let var_decl = quote! { let mut #var_ident: ::core::option::Option<#mod_ident::#enum_ident> = None; };
+    let var_decl =
+        quote! { let mut #var_ident: ::core::option::Option<#mod_ident::#enum_ident> = None; };
     let mut arms = Vec::new();
 
     for field in &msg.field {
