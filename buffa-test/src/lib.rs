@@ -53,6 +53,11 @@ pub mod collisions {
     include!(concat!(env!("OUT_DIR"), "/name_collisions.rs"));
 }
 
+#[allow(clippy::derivable_impls, clippy::match_single_binding, dead_code)]
+pub mod prelude_shadow {
+    include!(concat!(env!("OUT_DIR"), "/prelude_shadow.rs"));
+}
+
 #[allow(
     clippy::derivable_impls,
     clippy::match_single_binding,

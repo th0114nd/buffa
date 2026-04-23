@@ -48,6 +48,16 @@ fn main() {
         .compile()
         .expect("buffa_build failed for name_collisions.proto");
 
+    // Prelude shadowing (gh#36) — nested `message Option` with optional/oneof
+    // fields, built with views + JSON so all `Option<...>` emission paths are
+    // exercised. Compilation is the assertion.
+    buffa_build::Config::new()
+        .files(&["protos/prelude_shadow.proto"])
+        .includes(&["protos/"])
+        .generate_json(true)
+        .compile()
+        .expect("buffa_build failed for prelude_shadow.proto");
+
     // Proto2 with custom defaults, required fields, closed enums.
     buffa_build::Config::new()
         .files(&["protos/proto2_defaults.proto"])
