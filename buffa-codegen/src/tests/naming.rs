@@ -677,6 +677,72 @@ fn test_nested_option_blocked_propagates_through_sibling_subtree() {
 }
 
 #[test]
+fn test_cross_file_message_named_option_shadows_prelude() {
+    // Reproduces gh#64: two files share a package. File A defines a top-level
+    // `message Option`. File B has a oneof (which needs `Option<OneofEnum>`).
+    // Because ImportResolver only checks names within a single file, file B's
+    // resolver doesn't see file A's `Option` and emits bare `Option<...>`.
+    // The stitcher combines both files into one module scope via `include!`,
+    // so file A's `pub struct Option` shadows the prelude in file B's code.
+    let mut file_a = proto3_file("message.proto");
+    file_a.package = Some("pkg".to_string());
+    file_a.message_type = vec![DescriptorProto {
+        name: Some("Option".to_string()),
+        field: vec![make_field(
+            "text",
+            1,
+            Label::LABEL_OPTIONAL,
+            Type::TYPE_STRING,
+        )],
+        ..Default::default()
+    }];
+
+    let mut file_b = proto3_file("session.proto");
+    file_b.package = Some("pkg".to_string());
+    file_b.message_type = vec![DescriptorProto {
+        name: Some("Wrapper".to_string()),
+        field: vec![{
+            let mut f = make_field("a", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+            f.oneof_index = Some(0);
+            f
+        }],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("kind".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+
+    let config = CodeGenConfig {
+        generate_views: false,
+        ..Default::default()
+    };
+    let files = generate(
+        &[file_a, file_b],
+        &["message.proto".to_string(), "session.proto".to_string()],
+        &config,
+    )
+    .expect("cross-file Option should not break codegen");
+
+    // file B's owned output (session.rs) must use ::core::option::Option
+    // for the oneof field, not bare Option which would resolve to file A's struct.
+    let session_owned = files
+        .iter()
+        .find(|f| f.name.starts_with("session") && f.kind == GeneratedFileKind::Owned)
+        .expect("session owned file must exist");
+    assert!(
+        !session_owned.content.contains("pub kind: Option<"),
+        "bare Option<> in session.rs would shadow file A's struct: {}",
+        session_owned.content,
+    );
+    assert!(
+        session_owned.content.contains("::core::option::Option<"),
+        "session.rs must use fully-qualified ::core::option::Option: {}",
+        session_owned.content,
+    );
+}
+
+#[test]
 fn test_message_named_type_with_nested() {
     // Proto message named "Type" (a Rust keyword) with a nested message.
     // This must produce valid Rust: `pub mod r#type { ... }`.

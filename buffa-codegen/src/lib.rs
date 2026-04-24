@@ -548,7 +548,7 @@ fn generate_proto_content(
 
     validate_file(file)?;
 
-    let resolver = imports::ImportResolver::for_file(file);
+    let resolver = imports::ImportResolver::new();
     let features = crate::features::for_file(file);
 
     let mut owned = resolver.generate_use_block();
